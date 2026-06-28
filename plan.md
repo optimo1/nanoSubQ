@@ -1,36 +1,46 @@
-# Checklist: Building nanoSubQ AI
+# 🎯 The NanoSubQ "Learn This, Learn That" Checklist
 
-## 🟦 Phase 1: Python & PyTorch Basics
-* [ ] **Learn Python Class Basics:** Understand how to build a basic code blueprint (`class`) and use inheritance (`torch.nn.Module`)[cite: 4].
-* [ ] **Learn Tensor Basics:** Understand what tensor shapes represent (like `[Batch, Sequence, Features]`)[cite: 4].
-* [ ] **Write Multiplications from Scratch:** Write a basic matrix multiplication script using raw Python loops (no libraries allowed)[cite: 4].
-* [ ] **Use PyTorch Multiplications:** Reimplement your multiplication script using PyTorch's native `@` operator[cite: 4].
-* [ ] **Build a Custom Layer:** Write a custom linear layer (`Y = XW + b`) and run `.backward()` to inspect the tracking gradients[cite: 4].
+## 🟦 Phase 1: Learn Basic Python & PyTorch Variables
+- [ ] **Learn This:** How to store different types of data in Python (Strings, Integers, Floats).
+- [ ] **Learn That:** How to group data together using Python Lists and Dictionaries.
+- [ ] **Learn This:** How to use a `for` loop to make Python repeat an action over a list of items.
+- [ ] **Learn That:** How to bundle your code into a reusable block using functions (`def`).
+- [ ] **Learn This:** Object-Oriented Programming (OOP)—specifically how to create a `class` and understand how "inheritance" works (`class MyLayer(nn.Module)`)[cite: 4].
+- [ ] **Learn That:** Tensor shapes—how data grids are structured by `[Batch, Sequence, Features]`[cite: 4].
+- [ ] **Learn This:** Matrix multiplication syntax using PyTorch's native `@` operator[cite: 4].
+- [ ] **Learn That:** PyTorch Autograd—how calling `.backward()` automatically tracks math history and calculates gradients[cite: 4].
 
-## 🟩 Phase 2: Understanding Attention & The Bottleneck
-* [ ] **Study Attention Projections:** Learn how inputs map into Query ($Q$), Key ($K$), and Value ($V$) vectors[cite: 4].
-* [ ] **Build Masked Attention from Scratch:** Create a causal attention function using raw PyTorch operators, applying your own lower-triangular causal mask (`torch.tril`)[cite: 4].
-* [ ] **Profile the Math:** Run an empirical timing script across different sequence lengths ($512$, $1024$, $2048$)[cite: 4].
-* [ ] **Map the Bottleneck:** Document your profiling results in a table to visually confirm how memory and speed scale quadratically ($O(N^2)$)[cite: 4].
+---
 
-## 🟨 Phase 3: Sparse Attention & The Straight-Through Estimator (STE)
-* [ ] **Build a Causal Top-k Selector:** Write a function that zeroes out all historical keys except the top-$k$ highest-scoring ones, while keeping future positions masked[cite: 4].
-* [ ] **Write the Custom Autograd Layer:** Build `class STETopK(torch.autograd.Function)`[cite: 4]. 
-    * Forward pass: Apply the hard binary mask[cite: 4].
-    * Backward pass: Pass the gradients through completely unchanged[cite: 4].
-* [ ] **Run a Gradient Unit Test:** Hook your `STETopK` layer up to a mock routing layer and run a test to confirm the parameter updates successfully bypass the discrete selection step[cite: 4].
+## 🟩 Phase 2: Learn How Attention Works & Why It Breaks
+- [ ] **Learn This:** Query ($Q$), Key ($K$), and Value ($V$) linear projections—what they mean conceptually in a Transformer[cite: 4].
+- [ ] **Learn That:** Dot-product scaling—why dividing your scores by the square root of the head dimension keeps math stable[cite: 4].
+- [ ] **Learn This:** Causal masking—how to use `torch.tril` and `torch.masked_fill` to block a model from looking at future words[cite: 4].
+- [ ] **Learn That:** The Quadratic Bottleneck—why standard attention scales at $O(N^2)$, meaning if you double the text length, the computational cost quadruples[cite: 4].
 
-## 🟧 Phase 4: Gating Networks & Dynamic Masking
-* [ ] **Build the Gating Network Module:** Write an `SSARouter` class that projects queries and keys into a smaller routing space ($d_g \ll d_k$) to calculate normalized routing scores[cite: 4].
-* [ ] **Code the Combined Mask Generator:** Write a function that merges causal limits, a fixed local sliding window (always active), and dynamic top-$k$ selections into one final binary mask[cite: 4].
-* [ ] **Run a Causal Leakage Test:** Confirm via unit tests that tokens at index $t$ cannot affect gradients or activate tokens anywhere in the past or future[cite: 4].
+---
 
-## 🟥 Phase 5: Hacking and Training nanoGPT
-* [ ] **Refactor `model.py`:** Open Andrej Karpathy's `nanoGPT` engine and replace the standard `CausalSelfAttention` module with your newly built sparse module[cite: 4].
-* [ ] **Configure Safeguards:** Set up your training loop parameters to handle the STE adjustments[cite: 4]:
-    * Set a low learning rate (`3e-4`)[cite: 4].
-    * Turn off bias vectors in your routing layers to keep projections centered[cite: 4].
-    * Enable gradient clipping (`grad_clip_norm = 1.0`)[cite: 4].
-    * Turn on active weight decay (`1e-1`) to keep weights from saturating[cite: 4].
-* [ ] **Prepare the Data:** Run the Shakespeare data prep script inside your cloned directory[cite: 4].
-* [ ] **Train and Verify:** Initialize training on the Shakespeare character dataset, monitor the loss convergence, and run your profiling script to confirm that memory now scales linearly ($O(N \cdot k)$)[cite: 4].
+## 🟨 Phase 3: Learn the Straight-Through Estimator (STE)
+- [ ] **Learn This:** The `torch.topk` operator—how to make a program look across a row of numbers and extract only the highest values[cite: 4].
+- [ ] **Learn That:** Hard binary masking—how to convert top-$k$ positions into a matrix of hard `1.0`s and `0.0`s[cite: 4].
+- [ ] **Learn This:** The Non-Differentiable Problem—why picking top-$k$ tokens outputs a flat gradient of zero, which completely breaks standard backpropagation[cite: 4].
+- [ ] **Learn That:** Custom Autograd Functions—how to create a `torch.autograd.Function` to trick PyTorch[cite: 4].
+- [ ] **Learn This:** The STE pass-through trick—how to code a `backward` method that passes gradients through a hard mask completely unaltered[cite: 4].
+
+---
+
+## 🟧 Phase 4: Learn Routing Networks & Mixed Attention Masks
+- [ ] **Learn This:** Low-rank projections—how projecting big vectors into a tiny gating space ($d_g \ll d_k$) saves massive compute energy[cite: 4].
+- [ ] **Learn That:** Gate score normalization—how to build a router module to calculate dynamic contextual scores for historical keys[cite: 4].
+- [ ] **Learn This:** Sliding window attention—why keeping a small, fixed window of immediate token neighbors always active stabilizes early training[cite: 4].
+- [ ] **Learn That:** Mask merging—how to write a single generator function that fuses causality, local sliding windows, and dynamic top-$k$ historical selections into one final mask[cite: 4].
+- [ ] **Learn This:** Causal leakage validation—how to look at gradients to guarantee a token at index $t$ has absolutely zero impact on previous history[cite: 4].
+
+---
+
+## 🟥 Phase 5: Learn How to Hack & Control nanoGPT
+- [ ] **Learn This:** The structure of Andrej Karpathy's `model.py`—locating where the text flows into the core attention loops[cite: 4].
+- [ ] **Learn That:** Code refactoring—how to safely swap out the original dense `CausalSelfAttention` module and plug in your custom sparse gating module[cite: 4].
+- [ ] **Learn This:** Character-level token prep—how text datasets (like Shakespeare) are converted into raw integer arrays for training[cite: 4].
+- [ ] **Learn That:** STE training dynamics—why you must set a lower learning rate (`3e-4`), turn off routing layer biases, and use gradient clipping to prevent gradient explosions[cite: 4].
+- [ ] **Learn This:** Linear Scaling Performance—how to monitor validation loss and track VRAM usage to confirm your model successfully achieves linear $O(N \cdot k)$ efficiency[cite: 4].
