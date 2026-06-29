@@ -1,41 +1,24 @@
 # nanoSubQ AI
 
-This is my journey of developing **nanoSubQ AI** from scratch. 
+This is my journey of building **nanoSubQ AI** from scratch, using Andrej Karpathy's `nanoGPT` as a foundation. 
 
-The main goal of this project is to take Andrej Karpathy's legendary `nanoGPT` repository and rewrite its core attention loop. I am stripping out the standard dense self-attention mechanism and replacing it with **Subquadratic Sparse Attention (SSA)**. 
-
-Standard Transformers scale quadratically ($O(N^2)$), meaning they get exponentially slower and memory-heavy as text gets longer. nanoSubQ uses a learned, content-dependent routing network to calculate only the most high-signal token relationships, bringing that scaling cost down to a near-linear ($O(N \cdot k)$) curve.
-
-*Note: Since it's been a minute since I deeply used Python and PyTorch, I am building this in public while spending the first few weeks going through a serious refresher on tensor mechanics, OOP structures, and custom autograd pipelines before hacking the main architecture.*
+Since it’s been a while since I deeply touched Python and PyTorch, I'm spending the first few weeks mastering the basics again before hacking the model architecture.
 
 ---
 
-## 🗺️ The Strategy
+## 💡 The Core Concept
 
-Following the core architecture blueprint, the development is broken down into progressive milestones:
+The main goal of this project is to fix how modern AI handles long text:
 
-1. **Foundations:** Re-mastering PyTorch syntax, manual tensor slicing, and gradient graph tracking.
-2. **The Bottleneck:** Building a baseline causal attention layer from scratch to mathematically map out the $O(N^2)$ scaling issue.
-3. **The STE Hack:** Implementing a custom `torch.autograd.Function` using a Straight-Through Estimator (STE) to allow gradients to flow past the non-differentiable top-$k$ selection layer.
-4. **The Router:** Building a low-rank gating network (`SSARouter`) that fuses local sliding windows with dynamic historical routing.
-5. **The nanoGPT Intercept:** Swapping out the attention module inside Karpathy's `model.py` and training the new sparse model on the Shakespeare dataset.
+* **Normal AI Architecture:** Think of it like a person reading a book who has to re-read every single previous word every time they encounter a new one. It gets exponentially slower and takes massive amounts of memory as the text gets longer.
+* **SubQ AI Architecture:** Instead of looking at everything, the model uses a smart internal filter to instantly focus only on the most important, high-signal words from its history. This keeps the speed fast and steady no matter how long the text is.
 
 ---
 
-## 🛠️ The Architecture Blueprint
+## 📈 Follow My Journey
 
-The heart of the implementation relies on a Straight-Through Estimator to optimize the routing choice alongside token updates:
-
-$$\tilde{A}_{ij} = A_{ij} \cdot M_{STE,ij} + (1 - M_{STE,ij}) \cdot (-1\text{e}9)$$
-
-This setup allows the model to actively learn *which* historical parts of a sequence are actually worth paying attention to instead of checking every single box by default.
-
----
-
-## 📈 Follow Along
-
-I am documenting this entire process completely in public. I will be sharing my weekly milestones, deep dives, code updates, and inevitable bug fixes over on my LinkedIn page:
+I am building this project completely in public and sharing all my milestones, breakthroughs, and code updates over on my LinkedIn:
 
 👉 [www.linkedin.com/in/adilzhanturaliev](https://www.linkedin.com/in/adilzhanturaliev)
 
-Drop by, connect, and follow along to watch nanoSubQ AI come to life! 🚀
+Connect and follow along to watch it come to life! 🚀
