@@ -1,7 +1,7 @@
 # 🎯 The NanoSubQ "Learn This, Learn That" Checklist
 
 ## 🟦 Phase 1: Learn Basic Python & PyTorch Variables
-- [ ] **Learn This:** How to store different types of data in Python (Strings, Integers, Floats).
+- [done] **Learn This:** How to store different types of data in Python (Strings, Integers, Floats).
 - [ ] **Learn That:** How to group data together using Python Lists and Dictionaries.
 - [ ] **Learn This:** How to use a `for` loop to make Python repeat an action over a list of items.
 - [ ] **Learn That:** How to bundle your code into a reusable block using functions (`def`).
