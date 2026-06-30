@@ -4,8 +4,8 @@
 - [done] **Learn This:** How to store different types of data in Python (Strings, Integers, Floats).
 - [done] **Learn That:** How to group data together using Python Lists and Dictionaries.
 - [done] **Learn This:** How to use a `for` loop to make Python repeat an action over a list of items.
-- [ ] **Learn That:** How to bundle your code into a reusable block using functions (`def`).
-- [ ] **Learn This:** Object-Oriented Programming (OOP)—specifically how to create a `class` and understand how "inheritance" works (`class MyLayer(nn.Module)`)[cite: 4].
+- [done] **Learn That:** How to bundle your code into a reusable block using functions (`def`).
+- [done] **Learn This:** Object-Oriented Programming (OOP)—specifically how to create a `class` and understand how "inheritance" works (`class MyLayer(nn.Module)`)[cite: 4].
 - [ ] **Learn That:** Tensor shapes—how data grids are structured by `[Batch, Sequence, Features]`[cite: 4].
 - [ ] **Learn This:** Matrix multiplication syntax using PyTorch's native `@` operator[cite: 4].
 - [ ] **Learn That:** PyTorch Autograd—how calling `.backward()` automatically tracks math history and calculates gradients[cite: 4].
