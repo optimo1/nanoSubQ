@@ -260,5 +260,53 @@ raw_audio = torch.tensor([
 ])
 
 cleaned = raw_audio.view(-1,6)
-print(cleaned)
-print(cleaned.mean(dim=1))
+#print(cleaned)
+#print(cleaned.mean(dim=1))
+
+'''
+Calculating gradient using backwards calculus. Autograd is the tracking engine that stores calculations in memory and uses calculus to undo some of them.
+
+1. Flag a tensor
+
+use requires_grad=True
+
+eg:
+    x = torch.tensor([1,2,3], requires_grad=True)
+
+2. Computation Graph
+
+When you do something with the tensor you flagged, the autograd holds the calculations in memory, so it will be easier to trace back. It creates a hidden dynamic map called a Computational Graph.
+'''
+x = torch.tensor(3.0, requires_grad=True)
+m = torch.tensor(4.0)
+y = x * m
+loss = y**2
+
+#x ---(*m)---> y ---(**2)----> loss
+
+print(loss) #will show tensor(144., grad_fn=<PowBackward0>), which serves as a note that says the last action on this tensor was taking it into power.
+
+loss.backward()
+#print(x.grad)
+
+'''
+Backwards calculations:
+
+    It looks at the output as (x * m)^2, and it takes the derivative of the loss with respect to the initial value (x) using the chain rule.
+
+    derivative = 2 * x * m * m = 2 * y * m
+
+    so the gradient = 2 * 3.0 * 4.0 * 4.0 = 96.0
+
+    the gradient itself is stored in x.grad
+
+Rules of the Autograd:
+
+    1. Autograd stores only the final output x.grad. it doesnt store any intermediate grad values like y.grad
+
+    2. Drop the value after needed adjustments.
+
+    use .grad.zero_() to drop the gradient value to zero. When you used a gradient value and adjusted, drop the value to zero, so next time you use it, it wont get overwritten and will be like a brand new.
+'''
+
+
