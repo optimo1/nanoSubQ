@@ -310,3 +310,89 @@
 #'''
 
 
+# 1. The linear layer
+import torch
+import torch.nn as nn
+
+# Instead of manually writing X@W, PyTorch automatically creates this using layer.nn, you just tell how many inputs and outputs you need.
+layer = nn.Linear(in_features=3, out_features=2)
+
+#Inside of it, PyTorch implicitly creates a perfectly sized matrix with weights in this layer
+
+'''
+1. The Linear Layer:
+
+Instead of manually defining each layer using X@W, use PyTorch built-in nn.Linear thing
+
+Each layer has in_features(input) and out_features(output).
+
+We use torch.rand for initiallizing weights, so that the output of each layer wont be the same. It will be random, and we could adjust later.
+
+The formula that sits inside of the nn.Linear is:
+    Output = W^T * X + b
+
+where b is a bias vector. We use it as a safety pillow that allows us to adjust even if the weights are zero. This T power allows it to flip the shape of the tensor, so it could multiply them.
+
+The number of weight that model can have is unlimited, but RAM, GPU, and Time are limited. 
+'''
+
+#2. Activation
+
+activation = nn.ReLU()
+
+raw_data = torch.tensor([-1,2,3,5,-10,6])
+
+#print(activation(raw_data))
+
+'''
+One of the most widely used and recongnized activation methods is ReLU. 
+
+Its main purpose is simple: pass positive numbers in a tensor and crush negative numbers to zero.
+
+but why?
+
+Lets say, we need a model to analyze an image and say wether there is a pillow in a picture of a room.
+
+So one neuron looks for, for instance, grass. If it sees grass in a picture, it outputs a value like 10.0. But if it dont see it, it gives a value like -50.0. And, definitely, theres no grass in a room.
+
+In this case, ReLU says: "If you dont see what you are intended to see, then you are useless for this sample", so it crushes it down to 0.0.
+
+We need it for saving memory, efficiency, and relevancy.
+'''
+
+#3. The Module blueprint
+
+class Poop(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.layer1 = nn.Linear(3,4)
+
+        self.activation1 = nn.ReLU()
+
+        self.layer2 = nn.Linear(4,4)
+
+        self.activation2 = nn.ReLU()
+
+        self.layer3 = nn.Linear(4,1)
+
+    def forward(self, data):
+        data = self.layer1(data)
+
+        data = self.activation1(data)
+
+        data = self.layer2(data)
+
+        data = self.activation2(data)
+
+        data = self.layer3(data)
+
+        return data
+
+model = Poop()
+all_my_knobs = model.parameters()
+print(all_my_knobs)
+print(list(all_my_knobs))
+test = torch.tensor([[1.0, 2.0, 3.0]])
+prediction = model(test)
+print(prediction)
