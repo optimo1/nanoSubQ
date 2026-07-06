@@ -14,10 +14,13 @@
 ---
 
 ## 🟩 Phase 2: Learn How Attention Works & Why It Breaks
-- [ ] **Learn This:** Query ($Q$), Key ($K$), and Value ($V$) linear projections—what they mean conceptually in a Transformer[cite: 4].
-- [ ] **Learn That:** Dot-product scaling—why dividing your scores by the square root of the head dimension keeps math stable[cite: 4].
-- [ ] **Learn This:** Causal masking—how to use `torch.tril` and `torch.masked_fill` to block a model from looking at future words[cite: 4].
-- [ ] **Learn That:** The Quadratic Bottleneck—why standard attention scales at $O(N^2)$, meaning if you double the text length, the computational cost quadruples[cite: 4].
+- [done] **Learn This:** Query ($Q$), Key ($K$), and Value ($V$) linear projections—what they mean conceptually in a Transformer.
+- [ ] **Learn That:** Dot-product scaling—why dividing your scores by the square root of the head dimension keeps math stable.
+- [ ] **Learn This:** The Softmax Filter—how scores are turned into actual percentage weights so the model knows exactly how much percentage "focus" to place on each word.
+- [ ] **Learn That:** The Value Aggregation Step—how the model uses those percentage weights to blend the Value ($V$) vectors together to create the final context-aware output.
+- [ ] **Learn This:** Causal masking—how to use `torch.tril` and `torch.masked_fill` to block a model from looking at future words.
+- [ ] **Learn That:** Multi-Head Attention splitting—how a single large tensor is sliced up so the model can look at multiple different relationships at the exact same time (e.g., tracking grammar style and subject-verb relationships simultaneously).
+- [ ] **Learn This:** The Quadratic Bottleneck—why standard attention scales at $O(N^2)$, meaning if you double the text length, the computational cost quadruples.
 
 ---
 
