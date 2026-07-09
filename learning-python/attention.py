@@ -49,9 +49,9 @@ First class is used as a reusable tool for creating complete layer with activati
 Second class uses this reusable tool and sets up the needed amount of nodes(d_model) and layers(num_layer) using for loop. 
 
 This setup is considered the gold standard for big nns.
-'''
 
-# NN with proper attention block
+
+# NN with proper attention block -------------------------------------
 
 
 class Tool(nn.Module):
@@ -121,4 +121,76 @@ output_tensor = model(input_tokens)
 
 print(output_tensor)
 
+
+
+        '''
+
+# NN with casual masking
+
+class Tool(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+
+        self.d_model = d_model
+
+        self.Q_proj = nn.Linear(d_model, d_model)
+        self.K_proj = nn.Linear(d_model, d_model)
+        self.V_proj = nn.Linear(d_model, d_model)
+
+        self.linear_block = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU()
+        )
+
+        self.norm = nn.LayerNorm(d_model)
         
+    def forward(self, x):
+        shortcut = x
+        seq_len = x.size(0)
+
+        Q = self.Q_proj(x)
+        K = self.K_proj(x)
+        V = self.V_proj(x)
+
+        raw_scores = torch.matmul(Q, K.transpose(-2, -1))
+        scaled_scores = raw_scores / (self.d_model ** 0.5)
+
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        masked_scores = scaled_scores.masked_fill(mask, float('-inf'))
+
+        attention_weights = F.softmax(masked_scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, V)
+        
+        math_output = self.linear_block(attention_output)
+        output = math_output + shortcut
+
+        return self.norm(output)
+
+class Main(nn.Module):
+    def __init__(self, num_layers, d_model):
+        super().__init__()
+
+        self.layer = nn.ModuleList()
+
+        self.num_layers = num_layers
+        self.d_model = d_model
+
+        for _ in range(num_layers):
+            self.layer.append(Tool(d_model))
+            
+    def forward(self, x):
+        for layer in self.layer:
+            x = layer(x)
+        return x
+
+
+x = torch.tensor([
+    [1.0, 4.0, 6.0, 4.0],
+    [5.0, 7.0, 8.0, 1.0],
+    [9.0, 2.0, 3.0, 6.0]
+])
+Kaka = Main(num_layers=5, d_model=4)
+kaka_output = Kaka(x)
+print (kaka_output)
+
+
