@@ -123,8 +123,6 @@ print(output_tensor)
 
 
 
-        '''
-
 # NN with casual masking
 
 class Tool(nn.Module):
@@ -192,5 +190,281 @@ x = torch.tensor([
 Kaka = Main(num_layers=5, d_model=4)
 kaka_output = Kaka(x)
 print (kaka_output)
+
+
+# Multi-head processing
+
+class Tool(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+        self.head_dim = d_model // num_heads
+        assert d_model % num_heads == 0, "division should be even"
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.linear_block = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU()
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        shortcut = x
+        seq_len = x.size(0)
+
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q = Q.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1)
+        K = K.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1)
+        V = V.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1)
+
+        raw_scores = torch.matmul(Q, K.transpose(-2, -1))
+        scaled_scores = raw_scores / (self.head_dim ** 0.5)
+
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        masked_scores = scaled_scores.masked_fill(mask, float('-inf'))
+
+        attention_weights = F.softmax(masked_scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, V)
+
+        stitched_output = attention_output.transpose(0, 1).contiguous().view(seq_len, self.d_model)
+
+        blended_output = self.out_proj(stitched_output)
+
+        math_output = self.linear_block(blended_output)
+
+        combined_output = math_output + shortcut
+
+        return self.norm(combined_output)
+
+class Main(nn.Module):
+    def __init__(self, d_model, num_layers, num_heads):
+        super().__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.layer = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.layer.append(Tool(d_model, num_heads))
+
+    def forward(self, x):
+        for layer in self.layer:
+            x = layer(x)
+        return x
+
+
+# A 2D matrix of shape (4 words, 16 features each)
+x = torch.tensor([
+    [1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0],
+    [1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0, 1.0, 3.0, 5.0, 7.0],
+])
+
+Kaka = Main(d_model = 16, num_layers = 4 , num_heads = 4)
+Output = Kaka(x)
+print(Output)
+
+
+# Grouped-Query Attention
+
+class Tool(nn.Module):
+    def __init__(self, d_model, num_q_heads, num_kv_heads):
+        super().__init__()
+
+        self.d_model = d_model
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+
+        self.head_dim = d_model // num_q_heads
+        assert d_model % num_q_heads == 0, "should sdivide evenly"
+        assert num_q_heads % num_kv_heads == 0, "should sdivide evenly"
+
+        self.num_q_per_kv_head = num_q_heads // num_kv_heads
+
+        self.q_proj = nn.Linear(d_model, num_q_heads * self.head_dim)
+        self.k_proj = nn.Linear(d_model, num_kv_heads * self.head_dim)
+        self.v_proj = nn.Linear(d_model, num_kv_heads * self.head_dim)
+
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.linear_block = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU()
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        shortcut = x
+        seq_len = x.size(0)
+
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q = Q.view(seq_len, self.num_q_heads, self.head_dim).transpose(0, 1)
+        K = K.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
+        V = V.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
+
+        K = K.repeat_interleave(self.num_q_per_kv_head, dim = 0)
+        V = V.repeat_interleave(self.num_q_per_kv_head, dim = 0)
+
+        raw_scores = torch.matmul(Q, K.transpose(-2, -1))
+        scaled_scores = raw_scores / (self.head_dim ** 0.5)
+
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        masked_scores = scaled_scores.masked_fill(mask, float('-inf'))
+
+        attention_weights = F.softmax(masked_scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, V)
+
+        stitched_output = attention_output.transpose(0, 1).contiguous().view(seq_len, self.d_model)
+        blended_output = self.out_proj(stitched_output)
+
+        math_output = self.linear_block(blended_output)
+        combined = math_output + shortcut
+
+        return self.norm(combined)
+
+
+class Main(nn.Module):
+    def __init__(self, d_model, num_layers, num_q_heads, num_kv_heads):
+        super().__init__()
+
+        self.layers = nn.ModuleList([
+            Tool(d_model, num_q_heads, num_kv_heads) for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+
+x = torch.randn(4, 16)
+
+Kaka = Main(16, 4, 8, 2)
+output = Kaka(x)
+print(output)
+
+        
+'''
+
+
+# With RoPE block for order
+
+def Rotation(x):
+    num_heads, seq_len, head_dim = x.shape
+    assert head_dim % 2 == 0, "Should be even"
+
+    positions = torch.arange(seq_len, device = x.device).unsqueeze(1)
+
+    inv_freq = 1.0 / (1000 ** (torch.arange(0, head_dim, 2, device = x.device).float() / head_dim))
+    angles = positions * inv_freq
+
+    cos = torch.cos(angles).unsqueeze(0)
+    sin = torch.sin(angles).unsqueeze(0)
+
+    x_left = x[..., :head_dim //2]
+    x_right = x[..., head_dim // 2:]
+
+    rotates_left = x_left * cos - x_right * sin
+    rotates_right = x_right * cos + x_left * sin
+
+    return torch.cat([rotates_left, rotates_right], dim=-1)
+    
+
+class Tool(nn.Module):
+    def __init__(self, d_model, num_q_heads, num_kv_heads):
+        super().__init__()
+
+        self.d_model = d_model
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+
+        self.head_dim = d_model // num_q_heads
+        assert d_model % num_q_heads == 0, "should sdivide evenly"
+        assert num_q_heads % num_kv_heads == 0, "should sdivide evenly"
+
+        self.num_q_per_kv_head = num_q_heads // num_kv_heads
+
+        self.q_proj = nn.Linear(d_model, num_q_heads * self.head_dim)
+        self.k_proj = nn.Linear(d_model, num_kv_heads * self.head_dim)
+        self.v_proj = nn.Linear(d_model, num_kv_heads * self.head_dim)
+
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.linear_block = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU()
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        shortcut = x
+        seq_len = x.size(0)
+
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+
+        Q = Q.view(seq_len, self.num_q_heads, self.head_dim).transpose(0, 1)
+        K = K.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
+        V = V.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
+
+        Q = Rotation(Q)
+        K = Rotation(K)
+        
+        K = K.repeat_interleave(self.num_q_per_kv_head, dim = 0)
+        V = V.repeat_interleave(self.num_q_per_kv_head, dim = 0)
+
+        raw_scores = torch.matmul(Q, K.transpose(-2, -1))
+        scaled_scores = raw_scores / (self.head_dim ** 0.5)
+
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        masked_scores = scaled_scores.masked_fill(mask, float('-inf'))
+
+        attention_weights = F.softmax(masked_scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, V)
+
+        stitched_output = attention_output.transpose(0, 1).contiguous().view(seq_len, self.d_model)
+        blended_output = self.out_proj(stitched_output)
+
+        math_output = self.linear_block(blended_output)
+        combined = math_output + shortcut
+
+        return self.norm(combined)
+
+
+class Main(nn.Module):
+    def __init__(self, d_model, num_layers, num_q_heads, num_kv_heads):
+        super().__init__()
+
+        self.layers = nn.ModuleList([
+            Tool(d_model, num_q_heads, num_kv_heads) for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+x = torch.randn(4, 16)
+
+Kaka = Main(16, 4, 8, 2)
+output = Kaka(x)
+print(output)
+
 
 

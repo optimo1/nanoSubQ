@@ -19,8 +19,9 @@
 - [done] **Learn This:** The Softmax Filter—how scores are turned into actual percentage weights so the model knows exactly how much percentage "focus" to place on each word.
 - [done] **Learn That:** The Value Aggregation Step—how the model uses those percentage weights to blend the Value ($V$) vectors together to create the final context-aware output.
 - [done] **Learn This:** Causal masking—how to use `torch.triu` and `torch.masked_fill` to block a model from looking at future words.
-- [ ] **Learn That:** Multi-Head Attention splitting—how a single large tensor is sliced up so the model can look at multiple different relationships at the exact same time (e.g., tracking grammar style and subject-verb relationships simultaneously).
-- [ ] **Learn This:** The Quadratic Bottleneck—why standard attention scales at $O(N^2)$, meaning if you double the text length, the computational cost quadruples.
+- [done] **Learn That:** Multi-Head Attention splitting—how a single large tensor is sliced up so the model can look at multiple different relationships at the exact same time (e.g., tracking grammar style and subject-verb relationships simultaneously).
+- [done] **Learn That:** RoPE
+- [done] **Learn This:** The Quadratic Bottleneck—why standard attention scales at $O(N^2)$, meaning if you double the text length, the computational cost quadruples.
 
 ---
 
