@@ -26,9 +26,9 @@
 ---
 
 ## 🟨 Phase 3: Learn the Straight-Through Estimator (STE)
-- [ ] **Learn This:** The `torch.topk` operator—how to make a program look across a row of numbers and extract only the highest values[cite: 4].
-- [ ] **Learn That:** Hard binary masking—how to convert top-$k$ positions into a matrix of hard `1.0`s and `0.0`s[cite: 4].
-- [ ] **Learn This:** The Non-Differentiable Problem—why picking top-$k$ tokens outputs a flat gradient of zero, which completely breaks standard backpropagation[cite: 4].
+- [done] **Learn This:** The `torch.topk` operator—how to make a program look across a row of numbers and extract only the highest values[cite: 4].
+- [done] **Learn That:** Hard binary masking—how to convert top-$k$ positions into a matrix of hard `1.0`s and `0.0`s[cite: 4].
+- [done] **Learn This:** The Non-Differentiable Problem—why picking top-$k$ tokens outputs a flat gradient of zero, which completely breaks standard backpropagation[cite: 4].
 - [ ] **Learn That:** Custom Autograd Functions—how to create a `torch.autograd.Function` to trick PyTorch[cite: 4].
 - [ ] **Learn This:** The STE pass-through trick—how to code a `backward` method that passes gradients through a hard mask completely unaltered[cite: 4].
 
