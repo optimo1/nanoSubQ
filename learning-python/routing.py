@@ -15,12 +15,13 @@ class STE(torch.autograd.Function):
 
 
 class Router(nn.Module):
-    def __init__(self, n_embd: int, rank: int = 4, base_k: int = 4, block_size: int = 4):
+    def __init__(self, n_embd: int, rank: int = 4, base_k: int = 4, block_size: int = 4, temperature: float = 1.0):
         super().__init__()
         self.base_k = base_k
         self.block_size = block_size
         self.gate_down = nn.Linear(n_embd, rank, bias=False)
         self.gate_up = nn.Linear(rank, 1, bias=False)
+        self.temperature = temperature
 
     def calculate_k(self, seq_len: int) -> int:
         if seq_len <= self.block_size:
@@ -36,17 +37,19 @@ class Router(nn.Module):
 
         bottleneck = self.gate_down(x)
         raw_scores = self.gate_up(bottleneck)
+
+        norm_scores = F.softmax(raw_scores / self.temperature, dim=1)
         
         k = self.calculate_k(W)
 
-        topk_values, _ = torch.topk(raw_scores, k=k, dim=1, largest=True, sorted=False)
+        topk_values, _ = torch.topk(norm_scores, k=k, dim=1, largest=True, sorted=False)
         threshold = topk_values[:, -1:, :]
 
         # Clean binary mask: 1.0 for keep, 0.0 for drop.
-        hard_mask = (raw_scores >= threshold).float()
+        hard_mask = (norm_scores >= threshold).float()
         
         # STE cleanly passes gradients back to raw_scores
-        final_gate = STE.apply(raw_scores, hard_mask)
+        final_gate = STE.apply(norm_scores, hard_mask)
 
         assert isinstance(final_gate, torch.Tensor)
         return final_gate
