@@ -41,6 +41,37 @@
 - [done] **Learn That:** Mask merging—how to write a single generator function that fuses causality, local sliding windows, and dynamic top-$k$ historical selections into one final mask[cite: 4].
 - [done] **Learn This:** Causal leakage validation—how to look at gradients to guarantee a token at index $t$ has absolutely zero impact on previous history[cite: 4].
 
+## 2. Router Dynamics & Stability
+- [ ] **Straight-Through Estimator (STE) vs. Soft Approximations:** Compare discrete hard selection via custom `torch.autograd.Function` against soft continuous approximations (e.g., Gumbel-Softmax, Sigmoid thresholding) and analyze gradient variance trade-offs.
+- [ ] **Load-Balancing & Auxiliary Loss ($\mathcal{L}_{\text{aux}}$):** Implement an auxiliary load-balancing loss ($\mathcal{L}_{\text{aux}} = \alpha \cdot S \sum f_i P_i$) to prevent **Router Collapse**, where the router locks onto a small subset of tokens and starves model capacity.
+- [ ] **Temperature Annealing:** Implement temperature controls ($T \to 0$) on gating Softmax to smoothly transition from soft exploratory routing during early training to sharp, deterministic choices during fine-tuning and inference.
+
+---
+
+## 3. Edge Cases, Numerical Safety & Diagnostics
+- [ ] **LayerNorm Derivative Degeneracy:** Recognize why taking unweighted output sums (`output[t].sum()`) across LayerNorm layers cancels out input gradients ($\sum (v - \mu) \equiv 0$), and utilize non-uniform projection vectors (`(output[t] * proj).sum()`) for diagnostic autograd tests.
+- [ ] **Softmax NaN Mitigation:** Prevent division-by-zero or NaN outputs in positions where all keys are masked out (e.g., dynamic $k=0$ or edge conditions) using explicit `-inf` clamping or `torch.nan_to_num`.
+- [ ] **Mixed Precision (FP16/BF16) Underflow:** Ensure large additive negative values (e.g., `-1e4` vs. `-inf`) maintain correct dynamic range across GPU backends (`torch.cuda.amp`) without underflowing or causing numeric instability.
+
+---
+
+## 4. Hardware Realities & Scaling
+- [ ] **Materialized Masks vs. Kernel Fusion:** Analyze why full 2D mask tensors ($S \times S$) introduce an $\mathcal{O}(S^2)$ memory bottleneck despite sparse token selection, and explore block-sparse GPU kernel alternatives (e.g., Triton / Block-Sparse FlashAttention).
+- [ ] **Batched Sequence Routing ($B > 1$):** Extend 2D sequence-level mask generation to handle 3D batched inputs (`[Batch, Seq_Len, Dim]`) with variable top-$k$ selections per sequence.
+
+---
+
+## 5. Algorithmic Bounds & Attention Economics
+- [ ] **Dynamic $k$-Scaling Boundaries:** Formalize and test log-scale routing bounds ($k = \Theta(\log_2 S)$) to guarantee sub-quadratic compute scaling while keeping a constant lower bound ($k \ge 1$) for context retrieval.
+- [ ] **Sequence Length Invariance & Stress Testing:** Evaluate routing entropy and top-$k$ sparsity stability across drastically different context lengths (e.g., $S=64$ vs. $S=4096$) without retuning temperature hyper-parameters.
+- [ ] **Multi-Head Routing Strategies:** Compare **Shared Sequence-Level Routing** (single router per layer, used in `nanoSubQ`) against **Per-Head Independent Routing** ($H$ distinct gating matrices), quantifying memory vs. expressiveness trade-offs.
+
+---
+
+## 6. Training Dynamics & Convergence
+- [ ] **Routing Gradient Explosion / Vanishing:** Monitor gradient norms ($\|\nabla_{W} \mathcal{L}\|$) through the STE layer during early training steps to detect gradient saturation or spike instabilities.
+- [ ] **Entropy Regularization:** Experiment with router score entropy penalties ($-\sum P_i \log P_i$) to control router sharpness and prevent premature convergence to deterministic binary gates.
+
 ---
 
 ## 🟥 Phase 5: Learn How to Hack & Control nanoGPT
