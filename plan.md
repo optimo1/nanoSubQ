@@ -37,7 +37,7 @@
 ## 🟧 Phase 4: Learn Routing Networks & Mixed Attention Masks
 - [done] **Learn This:** Low-rank projections—how projecting big vectors into a tiny gating space ($d_g \ll d_k$) saves massive compute energy[cite: 4].
 - [done] **Learn That:** Gate score normalization—how to build a router module to calculate dynamic contextual scores for historical keys[cite: 4].
-- [ ] **Learn This:** Sliding window attention—why keeping a small, fixed window of immediate token neighbors always active stabilizes early training[cite: 4].
+- [done] **Learn This:** Sliding window attention—why keeping a small, fixed window of immediate token neighbors always active stabilizes early training[cite: 4].
 - [ ] **Learn That:** Mask merging—how to write a single generator function that fuses causality, local sliding windows, and dynamic top-$k$ historical selections into one final mask[cite: 4].
 - [ ] **Learn This:** Causal leakage validation—how to look at gradients to guarantee a token at index $t$ has absolutely zero impact on previous history[cite: 4].
 

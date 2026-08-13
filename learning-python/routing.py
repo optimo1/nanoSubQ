@@ -3,7 +3,6 @@ import math
 import torch.nn.functional as F
 import torch.nn as nn
 
-
 class STE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, raw_scores: torch.Tensor, hard_mask: torch.Tensor) -> torch.Tensor:
@@ -72,12 +71,13 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class Tool(nn.Module):
-    def __init__(self, d_model, num_q_heads, num_kv_heads):
+    def __init__(self, d_model, num_q_heads, num_kv_heads, window_size: int = 8):
         super().__init__()
         self.d_model = d_model
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_q_heads
+        self.window_size = window_size
         
         assert d_model % num_q_heads == 0, "Should divide evenly"
         assert num_q_heads % num_kv_heads == 0, "Should divide evenly"
@@ -124,12 +124,20 @@ class Tool(nn.Module):
         scaled_scores = raw_scores / (self.head_dim ** 0.5)
 
         # Causal mask + Router mask
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
-        masked_scores = scaled_scores.masked_fill(mask, float('-inf'))
+        row_idx = torch.arange(seq_len, device = x.device).unsqueeze(1)
+        col_idx = torch.arange(seq_len, device = x.device).unsqueeze(0)
 
-        # Differentiable routing mask (clean 1.0 vs 0.0 logic)
-        routing_mask = (1.0 - gate_mask.transpose(0, 1)) * -1e4
-        masked_scores = masked_scores + routing_mask
+        causal_mask = col_idx > row_idx
+        sliding_window_mask = (row_idx - col_idx >=0)&(row_idx - col_idx < self.window_size)
+
+        masked_scores = scaled_scores.masked_fill(causal_mask, float('-inf'))
+
+        routing_penalty = (1.0 - gate_mask.transpose(0, 1)) * -1e4
+
+        window_override = sliding_window_mask.float()
+        effective_penalty = routing_penalty * (1.0 - window_override)
+
+        masked_scores = masked_scores + effective_penalty
 
         attention_weights = F.softmax(masked_scores, dim=-1)
         attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
@@ -146,10 +154,10 @@ class Tool(nn.Module):
 
 
 class Main(nn.Module):
-    def __init__(self, d_model, num_layers, num_q_heads, num_kv_heads, max_seq_len=2048):
+    def __init__(self, d_model, num_layers, num_q_heads, num_kv_heads, window_size: int = 8, max_seq_len=2048):
         super().__init__()
         self.layer = nn.ModuleList([
-            Tool(d_model, num_q_heads, num_kv_heads) for _ in range(num_layers)
+            Tool(d_model, num_q_heads, num_kv_heads, window_size=window_size) for _ in range(num_layers)
         ])
         
         # Precompute RoPE frequencies once in __init__
@@ -173,7 +181,7 @@ class Main(nn.Module):
 
 
 if __name__ == "__main__":
-    torch.manual_seed(605)
+    torch.manual_seed(664)
     x_new = torch.randn(16, 16, requires_grad=True)
     Kaka_new = Main(16, 4, 8, 2)
         
