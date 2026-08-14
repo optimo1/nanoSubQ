@@ -44,7 +44,7 @@
 ## 2. Router Dynamics & Stability
 - [done] **Straight-Through Estimator (STE) vs. Soft Approximations:** Compare discrete hard selection via custom `torch.autograd.Function` against soft continuous approximations (e.g., Gumbel-Softmax, Sigmoid thresholding) and analyze gradient variance trade-offs.
 - [done] **Load-Balancing & Auxiliary Loss ($\mathcal{L}_{\text{aux}}$):** Implement an auxiliary load-balancing loss ($\mathcal{L}_{\text{aux}} = \alpha \cdot S \sum f_i P_i$) to prevent **Router Collapse**, where the router locks onto a small subset of tokens and starves model capacity.
-- [ ] **Temperature Annealing:** Implement temperature controls ($T \to 0$) on gating Softmax to smoothly transition from soft exploratory routing during early training to sharp, deterministic choices during fine-tuning and inference.
+- [done] **Temperature Annealing:** Implement temperature controls ($T \to 0$) on gating Softmax to smoothly transition from soft exploratory routing during early training to sharp, deterministic choices during fine-tuning and inference.
 
 ---
 

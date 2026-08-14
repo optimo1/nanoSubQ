@@ -26,6 +26,37 @@ def generate_unified_mask(
     return effective_penalty.masked_fill(causal_mask, float('-inf'))
 
 
+class TemperatureScheduler:
+    """Computes exponential temperature decay T -> t_min across training steps."""
+    def __init__(
+        self,
+        model: nn.Module,
+        t_max: float = 2.0,
+        t_min: float = 0.1,
+        total_steps: int = 1000
+    ):
+        self.model = model
+        self.t_max = t_max
+        self.t_min = t_min
+        self.total_steps = total_steps
+
+        # Formula: t_min = t_max * exp(-decay_rate * total_steps)
+        self.decay_rate = -math.log(t_min / t_max) / total_steps
+
+    def step(self, current_step: int) -> float:
+        if current_step >= self.total_steps:
+            new_t = self.t_min
+        else:
+            new_t = self.t_max * math.exp(-self.decay_rate * current_step)
+
+        # Update all Router instances found within the model
+        for module in self.model.modules():
+            if isinstance(module, Router):
+                module.set_temperature(new_t)
+
+        return new_t
+
+
 class STE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, raw_scores: torch.Tensor, hard_mask: torch.Tensor) -> torch.Tensor:
@@ -37,14 +68,28 @@ class STE(torch.autograd.Function):
 
 
 class Router(nn.Module):
-    def __init__(self, n_embd: int, rank: int = 4, base_k: int = 4, block_size: int = 4, temperature: float = 1.0, alpha: float = 0.01):
+    def __init__(
+        self, 
+        n_embd: int, 
+        rank: int = 4, 
+        base_k: int = 4, 
+        block_size: int = 4,
+        init_temperature: float = 2.0,
+        min_temperature: float = 0.1, 
+        alpha: float = 0.01
+    ):
         super().__init__()
         self.base_k = base_k
         self.block_size = block_size
         self.gate_down = nn.Linear(n_embd, rank, bias=False)
         self.gate_up = nn.Linear(rank, 1, bias=False)
-        self.temperature = temperature
+        self.temperature = init_temperature
+        self.min_temperature = min_temperature
         self.alpha = alpha
+
+    def set_temperature(self, new_temp: float):
+        """Safely updates active temperature without dropping below min_temperature."""
+        self.temperature = max(new_temp, self.min_temperature)
 
     def calculate_k(self, seq_len: int) -> int:
         if seq_len <= self.block_size:
@@ -61,6 +106,9 @@ class Router(nn.Module):
         bottleneck = self.gate_down(x)
         raw_scores = self.gate_up(bottleneck)
 
+        # Temperature scales raw scores before Sigmoid
+        # T = 2.0 -> scores pull toward 0.5 (exploration, high gradient)
+        # T -> 0.1 -> scores push toward 0.0 or 1.0 (deterministic decisions)
         norm_scores = torch.sigmoid(raw_scores / self.temperature)
         P = norm_scores.squeeze(-1).mean(dim=0)
         
@@ -69,13 +117,10 @@ class Router(nn.Module):
         topk_values, _ = torch.topk(norm_scores, k=k, dim=1, largest=True, sorted=False)
         threshold = topk_values[:, -1:, :]
 
-        # Clean binary mask: 1.0 for keep, 0.0 for drop.
         hard_mask = (norm_scores >= threshold).float()
-        f = hard_mask.squeeze(-1).mean(dim=0)  # FIXED: squeeze instead of unsqueeze
+        f = hard_mask.squeeze(-1).mean(dim=0)
         
-        # STE cleanly passes gradients back to raw_scores
         final_gate = STE.apply(norm_scores, hard_mask)
-
         aux_loss = self.alpha * W * torch.sum(f * P)
 
         assert isinstance(final_gate, torch.Tensor)
@@ -127,12 +172,10 @@ class Tool(nn.Module):
         shortcut = x
         seq_len = x.size(0)
 
-        # FIXED: Clean single-call router unpack
         x_batched = x.unsqueeze(0)
         gate_mask, aux_loss = self.router(x_batched)
         gate_mask = gate_mask.squeeze(0)
 
-        # 2. Project Q, K, V
         Q = self.q_proj(x)
         K = self.k_proj(x)
         V = self.v_proj(x)
@@ -141,7 +184,6 @@ class Tool(nn.Module):
         K = K.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
         V = V.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1)
 
-        # 3. Apply Cached RoPE
         Q = apply_rotary_emb(Q, cos, sin)
         K = apply_rotary_emb(K, cos, sin)
 
@@ -205,18 +247,14 @@ def verify_causal_leakage(model: nn.Module, seq_len: int = 16, d_model: int = 16
     model.zero_grad()
     
     x = torch.randn(seq_len, d_model, requires_grad=True)
-    
-    # FIXED: Unpack tuple return
     output, aux_loss = model(x)
     
     target_idx = 5
-    
     grad_projection = torch.randn_like(output[target_idx])
     target_loss = (output[target_idx] * grad_projection).sum()
     target_loss.backward()
     
-    input_grads = x.grad  # Shape: (seq_len, d_model)
-    
+    input_grads = x.grad
     past_grads = input_grads[:target_idx + 1].norm().item()
     future_grads = input_grads[target_idx + 1:].norm().item()
     
@@ -228,23 +266,48 @@ def verify_causal_leakage(model: nn.Module, seq_len: int = 16, d_model: int = 16
     assert future_grads == 0.0, "❌ CRITICAL: Causal leakage detected!"
     print("✅ SUCCESS: Zero causal leakage verified! Future gradients are strictly 0.0.")
 
-    
+
 if __name__ == "__main__":
     torch.manual_seed(686)
-    x_new = torch.randn(16, 16, requires_grad=True)
-    Kaka_new = Main(16, 4, 8, 2)
-        
-    # FIXED: Unpack tuple return
-    output_new, total_aux_loss = Kaka_new(x_new)
-    loss_new = output_new.sum() + total_aux_loss
-    loss_new.backward()
-        
-    down_grad = Kaka_new.layer[0].router.gate_down.weight.grad
-    up_grad = Kaka_new.layer[0].router.gate_up.weight.grad
+    
+    model = Main(d_model=16, num_layers=4, num_q_heads=8, num_kv_heads=2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    
+    TOTAL_STEPS = 50
+    scheduler = TemperatureScheduler(
+        model, 
+        t_max=2.0, 
+        t_min=0.1, 
+        total_steps=TOTAL_STEPS
+    )
 
-    print("Task + Aux Loss:", loss_new.item())
-    print("Down Projection Grad Norm:", down_grad.norm().item())
-    print("Up Projection Grad Norm:", up_grad.norm().item())
+    print("=== Training Simulation with Temperature Annealing ===")
+    for step in range(TOTAL_STEPS + 1):
+        x = torch.randn(16, 16, requires_grad=True)
+        
+        # 1. Decay temperature across all Routers
+        current_temp = scheduler.step(step)
+        
+        # 2. Forward pass
+        output, total_aux_loss = model(x)
+        loss = output.sum() + total_aux_loss
+        
+        # 3. Backward pass & step
+        optimizer.zero_grad()
+        loss.backward()
+        
+        down_grad = model.layer[0].router.gate_down.weight.grad.norm().item()
+        up_grad = model.layer[0].router.gate_up.weight.grad.norm().item()
+        
+        optimizer.step()
 
-    # Run Causal Leakage Validation
-    verify_causal_leakage(Kaka_new)
+        if step % 10 == 0:
+            print(
+                f"Step {step:2d} | "
+                f"Temp: {current_temp:.4f} | "
+                f"Total Loss: {loss.item():.4f} | "
+                f"Gate Down Grad: {down_grad:.6f}"
+            )
+
+    # Verify causal integrity post-training
+    verify_causal_leakage(model)
