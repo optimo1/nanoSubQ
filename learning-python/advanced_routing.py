@@ -25,7 +25,7 @@ def generate_unified_mask(
 
     return effective_penalty.masked_fill(causal_mask, float('-inf'))
 
-    
+
 class STE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, raw_scores: torch.Tensor, hard_mask: torch.Tensor) -> torch.Tensor:
@@ -37,13 +37,14 @@ class STE(torch.autograd.Function):
 
 
 class Router(nn.Module):
-    def __init__(self, n_embd: int, rank: int = 4, base_k: int = 4, block_size: int = 4, temperature: float = 1.0):
+    def __init__(self, n_embd: int, rank: int = 4, base_k: int = 4, block_size: int = 4, temperature: float = 1.0, alpha: float = 0.01):
         super().__init__()
         self.base_k = base_k
         self.block_size = block_size
         self.gate_down = nn.Linear(n_embd, rank, bias=False)
         self.gate_up = nn.Linear(rank, 1, bias=False)
         self.temperature = temperature
+        self.alpha = alpha
 
     def calculate_k(self, seq_len: int) -> int:
         if seq_len <= self.block_size:
@@ -54,13 +55,14 @@ class Router(nn.Module):
         optimized_k = ((raw_k + self.block_size - 1) // self.block_size) * self.block_size
         return min(optimized_k, seq_len)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         S, W, C = x.size()
 
         bottleneck = self.gate_down(x)
         raw_scores = self.gate_up(bottleneck)
 
-        norm_scores = F.softmax(raw_scores / self.temperature, dim=1)
+        norm_scores = torch.sigmoid(raw_scores / self.temperature)
+        P = norm_scores.squeeze(-1).mean(dim=0)
         
         k = self.calculate_k(W)
 
@@ -69,16 +71,18 @@ class Router(nn.Module):
 
         # Clean binary mask: 1.0 for keep, 0.0 for drop.
         hard_mask = (norm_scores >= threshold).float()
+        f = hard_mask.squeeze(-1).mean(dim=0)  # FIXED: squeeze instead of unsqueeze
         
         # STE cleanly passes gradients back to raw_scores
         final_gate = STE.apply(norm_scores, hard_mask)
 
+        aux_loss = self.alpha * W * torch.sum(f * P)
+
         assert isinstance(final_gate, torch.Tensor)
-        return final_gate
+        return final_gate, aux_loss
 
 
 def apply_rotary_emb(x, cos, sin):
-    # Slice dynamically to match the current sequence length
     seq_len = x.shape[1]
     cos = cos[:, :seq_len, :]
     sin = sin[:, :seq_len, :]
@@ -106,7 +110,7 @@ class Tool(nn.Module):
         assert num_q_heads % num_kv_heads == 0, "Should divide evenly"
 
         self.num_q_per_kv = num_q_heads // num_kv_heads
-        self.router = Router(n_embd=d_model, base_k=4, block_size=4, rank = 4)
+        self.router = Router(n_embd=d_model, base_k=4, block_size=4, rank=4, alpha=0.01)
 
         self.q_proj = nn.Linear(d_model, num_q_heads * self.head_dim)
         self.k_proj = nn.Linear(d_model, num_kv_heads * self.head_dim)
@@ -119,13 +123,14 @@ class Tool(nn.Module):
         )
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin) -> tuple[torch.Tensor, torch.Tensor]:
         shortcut = x
         seq_len = x.size(0)
 
-        # 1. Get mask from router: (seq_len, 1)
+        # FIXED: Clean single-call router unpack
         x_batched = x.unsqueeze(0)
-        gate_mask = self.router(x_batched).squeeze(0)
+        gate_mask, aux_loss = self.router(x_batched)
+        gate_mask = gate_mask.squeeze(0)
 
         # 2. Project Q, K, V
         Q = self.q_proj(x)
@@ -145,7 +150,6 @@ class Tool(nn.Module):
 
         raw_scores = torch.matmul(Q, K.transpose(-2, -1))
         scaled_scores = raw_scores / (self.head_dim ** 0.5)
-
 
         unified_mask = generate_unified_mask(
             seq_len=seq_len,
@@ -168,7 +172,7 @@ class Tool(nn.Module):
         math_output = self.layer_block(blended_output)
         combined_output = math_output + shortcut
 
-        return self.norm(combined_output)
+        return self.norm(combined_output), aux_loss
 
 
 class Main(nn.Module):
@@ -186,35 +190,31 @@ class Main(nn.Module):
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
         angles = positions * inv_freq
         
-        # Register as buffers so they move to the correct device automatically
         self.register_buffer("cos_cached", torch.cos(angles).unsqueeze(0), persistent=False)
         self.register_buffer("sin_cached", torch.sin(angles).unsqueeze(0), persistent=False)
 
-    def forward(self, x):
-        # Pass the precomputed buffers to the layers
+    def forward(self, x) -> tuple[torch.Tensor, torch.Tensor]:
+        total_aux_loss = torch.tensor(0.0, device=x.device)
         for layer in self.layer:
-            x = layer(x, self.cos_cached, self.sin_cached)
-        return x
+            x, aux_loss = layer(x, self.cos_cached, self.sin_cached)
+            total_aux_loss = total_aux_loss + aux_loss
+        return x, total_aux_loss
 
 
 def verify_causal_leakage(model: nn.Module, seq_len: int = 16, d_model: int = 16):
     model.zero_grad()
     
-    # 1. Input tensor
     x = torch.randn(seq_len, d_model, requires_grad=True)
     
-    # 2. Forward pass
-    output = model(x)
+    # FIXED: Unpack tuple return
+    output, aux_loss = model(x)
     
-    # 3. Target token (Index 5)
     target_idx = 5
     
-    # FIX: Use non-uniform weighting to avoid LayerNorm zero-sum derivative cancellation
     grad_projection = torch.randn_like(output[target_idx])
     target_loss = (output[target_idx] * grad_projection).sum()
     target_loss.backward()
     
-    # 4. Extract input gradients
     input_grads = x.grad  # Shape: (seq_len, d_model)
     
     past_grads = input_grads[:target_idx + 1].norm().item()
@@ -234,15 +234,17 @@ if __name__ == "__main__":
     x_new = torch.randn(16, 16, requires_grad=True)
     Kaka_new = Main(16, 4, 8, 2)
         
-    output_new = Kaka_new(x_new)
-    loss_new = output_new.sum()
+    # FIXED: Unpack tuple return
+    output_new, total_aux_loss = Kaka_new(x_new)
+    loss_new = output_new.sum() + total_aux_loss
     loss_new.backward()
         
     down_grad = Kaka_new.layer[0].router.gate_down.weight.grad
     up_grad = Kaka_new.layer[0].router.gate_up.weight.grad
 
+    print("Task + Aux Loss:", loss_new.item())
     print("Down Projection Grad Norm:", down_grad.norm().item())
     print("Up Projection Grad Norm:", up_grad.norm().item())
 
-    # --- Run Causal Leakage Validation ---
+    # Run Causal Leakage Validation
     verify_causal_leakage(Kaka_new)
