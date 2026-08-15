@@ -49,9 +49,9 @@
 ---
 
 ## 3. Edge Cases, Numerical Safety & Diagnostics
-- [ ] **LayerNorm Derivative Degeneracy:** Recognize why taking unweighted output sums (`output[t].sum()`) across LayerNorm layers cancels out input gradients ($\sum (v - \mu) \equiv 0$), and utilize non-uniform projection vectors (`(output[t] * proj).sum()`) for diagnostic autograd tests.
-- [ ] **Softmax NaN Mitigation:** Prevent division-by-zero or NaN outputs in positions where all keys are masked out (e.g., dynamic $k=0$ or edge conditions) using explicit `-inf` clamping or `torch.nan_to_num`.
-- [ ] **Mixed Precision (FP16/BF16) Underflow:** Ensure large additive negative values (e.g., `-1e4` vs. `-inf`) maintain correct dynamic range across GPU backends (`torch.cuda.amp`) without underflowing or causing numeric instability.
+- [done] **LayerNorm Derivative Degeneracy:** Recognize why taking unweighted output sums (`output[t].sum()`) across LayerNorm layers cancels out input gradients ($\sum (v - \mu) \equiv 0$), and utilize non-uniform projection vectors (`(output[t] * proj).sum()`) for diagnostic autograd tests.
+- [done] **Softmax NaN Mitigation:** Prevent division-by-zero or NaN outputs in positions where all keys are masked out (e.g., dynamic $k=0$ or edge conditions) using explicit `-inf` clamping or `torch.nan_to_num`.
+- [done] **Mixed Precision (FP16/BF16) Underflow:** Ensure large additive negative values (e.g., `-1e4` vs. `-inf`) maintain correct dynamic range across GPU backends (`torch.cuda.amp`) without underflowing or causing numeric instability.
 
 ---
 

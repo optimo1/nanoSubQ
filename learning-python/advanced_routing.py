@@ -7,7 +7,7 @@ def generate_unified_mask(
     seq_len: int,
     window_size: int,
     gate_mask: torch.Tensor,
-    penalty_value: float = -1000.0,
+    penalty_value: float = -1e4,
     device: torch.device = torch.device("cpu")
 ) -> torch.Tensor:
     row_idx = torch.arange(seq_len, device=device).unsqueeze(1)
@@ -27,7 +27,6 @@ def generate_unified_mask(
 
 
 class TemperatureScheduler:
-    """Computes exponential temperature decay T -> t_min across training steps."""
     def __init__(
         self,
         model: nn.Module,
@@ -40,7 +39,6 @@ class TemperatureScheduler:
         self.t_min = t_min
         self.total_steps = total_steps
 
-        # Formula: t_min = t_max * exp(-decay_rate * total_steps)
         self.decay_rate = -math.log(t_min / t_max) / total_steps
 
     def step(self, current_step: int) -> float:
@@ -49,7 +47,6 @@ class TemperatureScheduler:
         else:
             new_t = self.t_max * math.exp(-self.decay_rate * current_step)
 
-        # Update all Router instances found within the model
         for module in self.model.modules():
             if isinstance(module, Router):
                 module.set_temperature(new_t)
@@ -88,7 +85,6 @@ class Router(nn.Module):
         self.alpha = alpha
 
     def set_temperature(self, new_temp: float):
-        """Safely updates active temperature without dropping below min_temperature."""
         self.temperature = max(new_temp, self.min_temperature)
 
     def calculate_k(self, seq_len: int) -> int:
@@ -106,9 +102,6 @@ class Router(nn.Module):
         bottleneck = self.gate_down(x)
         raw_scores = self.gate_up(bottleneck)
 
-        # Temperature scales raw scores before Sigmoid
-        # T = 2.0 -> scores pull toward 0.5 (exploration, high gradient)
-        # T -> 0.1 -> scores push toward 0.0 or 1.0 (deterministic decisions)
         norm_scores = torch.sigmoid(raw_scores / self.temperature)
         P = norm_scores.squeeze(-1).mean(dim=0)
         
@@ -121,7 +114,7 @@ class Router(nn.Module):
         f = hard_mask.squeeze(-1).mean(dim=0)
         
         final_gate = STE.apply(norm_scores, hard_mask)
-        aux_loss = self.alpha * W * torch.sum(f * P)
+        aux_loss = self.alpha * torch.mean(f * P)
 
         assert isinstance(final_gate, torch.Tensor)
         return final_gate, aux_loss
@@ -197,7 +190,7 @@ class Tool(nn.Module):
             seq_len=seq_len,
             window_size=self.window_size,
             gate_mask=gate_mask,
-            penalty_value=-1000.0,
+            penalty_value=-1e4,
             device=x.device
         )
 
@@ -236,7 +229,7 @@ class Main(nn.Module):
         self.register_buffer("sin_cached", torch.sin(angles).unsqueeze(0), persistent=False)
 
     def forward(self, x) -> tuple[torch.Tensor, torch.Tensor]:
-        total_aux_loss = torch.tensor(0.0, device=x.device)
+        total_aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         for layer in self.layer:
             x, aux_loss = layer(x, self.cos_cached, self.sin_cached)
             total_aux_loss = total_aux_loss + aux_loss
@@ -268,7 +261,7 @@ def verify_causal_leakage(model: nn.Module, seq_len: int = 16, d_model: int = 16
 
 
 if __name__ == "__main__":
-    torch.manual_seed(686)
+    torch.manual_seed(706)
     
     model = Main(d_model=16, num_layers=4, num_q_heads=8, num_kv_heads=2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
@@ -285,17 +278,18 @@ if __name__ == "__main__":
     for step in range(TOTAL_STEPS + 1):
         x = torch.randn(16, 16, requires_grad=True)
         
-        # 1. Decay temperature across all Routers
         current_temp = scheduler.step(step)
         
-        # 2. Forward pass
         output, total_aux_loss = model(x)
-        loss = output.sum() + total_aux_loss
+        target = torch.randn_like(output)
+        task_loss = F.mse_loss(output, target)
+        loss = task_loss + total_aux_loss
         
-        # 3. Backward pass & step
         optimizer.zero_grad()
         loss.backward()
-        
+                
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
         down_grad = model.layer[0].router.gate_down.weight.grad.norm().item()
         up_grad = model.layer[0].router.gate_up.weight.grad.norm().item()
         
@@ -309,5 +303,4 @@ if __name__ == "__main__":
                 f"Gate Down Grad: {down_grad:.6f}"
             )
 
-    # Verify causal integrity post-training
     verify_causal_leakage(model)
