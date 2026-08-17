@@ -56,8 +56,8 @@
 ---
 
 ## 4. Hardware Realities & Scaling
-- [ ] **Materialized Masks vs. Kernel Fusion:** Analyze why full 2D mask tensors ($S \times S$) introduce an $\mathcal{O}(S^2)$ memory bottleneck despite sparse token selection, and explore block-sparse GPU kernel alternatives (e.g., Triton / Block-Sparse FlashAttention).
-- [ ] **Batched Sequence Routing ($B > 1$):** Extend 2D sequence-level mask generation to handle 3D batched inputs (`[Batch, Seq_Len, Dim]`) with variable top-$k$ selections per sequence.
+- [done] **Materialized Masks vs. Kernel Fusion:** Analyze why full 2D mask tensors ($S \times S$) introduce an $\mathcal{O}(S^2)$ memory bottleneck despite sparse token selection, and explore block-sparse GPU kernel alternatives (e.g., Triton / Block-Sparse FlashAttention).
+- [done] **Batched Sequence Routing ($B > 1$):** Extend 2D sequence-level mask generation to handle 3D batched inputs (`[Batch, Seq_Len, Dim]`) with variable top-$k$ selections per sequence.
 
 ---
 
