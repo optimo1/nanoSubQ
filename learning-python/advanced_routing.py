@@ -27,18 +27,19 @@ class TemperatureScheduler:
             new_t = self.t_max * math.exp(-self.decay_rate * current_step)
 
         for module in self.model.modules():
-            if isinstance(module, BatchedRouter):
+            if isinstance(module, PerKVHeadRouter):
                 module.set_temperature(new_t)
 
         return new_t
 
 
-class BatchedRouter(nn.Module):
-    """Evaluates long-range historical candidates [B, 0...S-W-1] while bypassing the dense sliding window [B, S-W...S-1]."""
+class PerKVHeadRouter(nn.Module):
+    """Evaluates long-range historical candidates per KV head [B, H_kv, S]."""
 
     def __init__(
         self,
-        n_embd: int,
+        head_dim: int,
+        num_kv_heads: int,
         rank: int = 4,
         base_k: int = 4,
         block_size: int = 4,
@@ -49,8 +50,11 @@ class BatchedRouter(nn.Module):
         super().__init__()
         self.base_k = base_k
         self.block_size = block_size
-        self.gate_down = nn.Linear(n_embd, rank, bias=False)
+        self.num_kv_heads = num_kv_heads
+
+        self.gate_down = nn.Linear(head_dim, rank, bias=False)
         self.gate_up = nn.Linear(rank, 1, bias=False)
+
         self.temperature = init_temperature
         self.min_temperature = min_temperature
         self.alpha = alpha
@@ -69,78 +73,90 @@ class BatchedRouter(nn.Module):
         ) * self.block_size
         return min(optimized_k, seq_len)
 
-    def forward(
-        self, x: torch.Tensor, window_size: int = 8
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # x shape: [B, S, D]
-        B, S, _ = x.shape
+    def calculate_routing_entropy(
+        self, norm_scores: torch.Tensor, eps: float = 1e-7
+    ) -> torch.Tensor:
+        """Computes stable average binary Shannon entropy (in bits) over gate scores."""
+        p = torch.clamp(norm_scores, eps, 1.0 - eps)
+        entropy = -p * torch.log2(p) - (1.0 - p) * torch.log2(1.0 - p)
+        entropy = torch.nan_to_num(entropy, nan=0.0)
+        return entropy.mean()
 
-        bottleneck = self.gate_down(x)                           # [B, S, rank]
-        raw_scores = self.gate_up(bottleneck).squeeze(-1)         # [B, S]
+    def forward(
+        self, k_states: torch.Tensor, window_size: int = 8
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # k_states: [B, H_kv, S, D_head]
+        B, H_kv, S, D_head = k_states.shape
+
+        bottleneck = self.gate_down(k_states)                       # [B, H_kv, S, rank]
+        raw_scores = self.gate_up(bottleneck).squeeze(-1)           # [B, H_kv, S]
 
         norm_scores = torch.sigmoid(raw_scores / self.temperature)
         P = norm_scores.mean()
 
+        routing_entropy = self.calculate_routing_entropy(norm_scores)
         hist_len = max(0, S - window_size)
 
-        # Local window token indices across batch
         local_indices = (
-            torch.arange(hist_len, S, device=x.device)
+            torch.arange(hist_len, S, device=k_states.device)
             .unsqueeze(0)
-            .expand(B, -1)
-        )                                                         # [B, W]
+            .unsqueeze(0)
+            .expand(B, H_kv, -1)
+        )                                                           # [B, H_kv, W]
 
         if hist_len > 0:
-            hist_scores = norm_scores[:, :hist_len]               # [B, hist_len]
+            hist_scores = norm_scores[:, :, :hist_len]              # [B, H_kv, hist_len]
             k_global = self.calculate_k(hist_len)
 
             topk_scores, global_indices = torch.topk(
-                hist_scores, k=k_global, dim=1, largest=True, sorted=True
-            )                                                     # [B, K_global]
+                hist_scores, k=k_global, dim=-1, largest=True, sorted=True
+            )                                                       # [B, H_kv, K_global]
 
-            local_scores = torch.ones(
-                B, S - hist_len, device=x.device, dtype=norm_scores.dtype
-            )
+            local_scores = norm_scores[:, :, hist_len:]             # [B, H_kv, W]
 
-            combined_indices = torch.cat(
-                [global_indices, local_indices], dim=1
-            )                                                     # [B, K_total]
-            combined_scores = torch.cat(
-                [topk_scores, local_scores], dim=1
-            )                                                     # [B, K_total]
+            combined_indices = torch.cat([global_indices, local_indices], dim=-1)
+            combined_scores = torch.cat([topk_scores, local_scores], dim=-1)
         else:
             combined_indices = local_indices
-            combined_scores = torch.ones(
-                B, S, device=x.device, dtype=norm_scores.dtype
-            )
+            combined_scores = norm_scores
 
-        # Sort combined indices chronologically to preserve causality
-        selected_indices, sort_perm = torch.sort(combined_indices, dim=1)
-        selected_scores = torch.gather(combined_scores, dim=1, index=sort_perm)
+        # Chronological sort per head
+        selected_indices, sort_perm = torch.sort(combined_indices, dim=-1)
+        selected_scores = torch.gather(combined_scores, dim=-1, index=sort_perm)
 
-        # Auxiliary loss
-        k_total = selected_indices.size(1)
-        f = torch.tensor(k_total / S, device=x.device, dtype=x.dtype)
+        # Aux loss
+        k_total = selected_indices.size(-1)
+        f = torch.tensor(k_total / S, device=k_states.device, dtype=k_states.dtype)
         aux_loss = self.alpha * (f * P)
 
-        # Straight-Through Estimator soft scaling
-        gate_multiplier = selected_scores + (1.0 - selected_scores).detach()
-        selected_weights = selected_scores * gate_multiplier
+        # Straight-Through Estimator (STE) dynamic thresholding
+        hard_weights = (selected_scores > 0.5).to(dtype=selected_scores.dtype)
+        selected_weights = selected_scores + (hard_weights - selected_scores).detach()
 
-        return selected_indices, selected_weights, aux_loss
+        return selected_indices, selected_weights, aux_loss, routing_entropy
 
 
-def apply_rotary_emb_3d(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+def apply_rotary_emb_indexed(
+    x: torch.Tensor,
+    cos_cached: torch.Tensor,
+    sin_cached: torch.Tensor,
+    indices: torch.Tensor,
 ) -> torch.Tensor:
-    # x shape: [B, H, K, D_head]
-    seq_len = x.shape[2]
-    cos = cos[:, :, :seq_len, :]
-    sin = sin[:, :, :seq_len, :]
+    """
+    Applies RoPE per head using direct tensor indexing.
+    x: [B, H, K, D_head]
+    indices: [B, H, K]
+    """
+    B, H, K, D_head = x.shape
+    cos_table = cos_cached.squeeze(0).squeeze(0)  # [Max_S, D_head/2]
+    sin_table = sin_cached.squeeze(0).squeeze(0)  # [Max_S, D_head/2]
 
-    head_dim = x.shape[-1]
-    x_left = x[..., : head_dim // 2]
-    x_right = x[..., head_dim // 2 :]
+    # Direct multi-dimensional indexing
+    cos = cos_table[indices]                      # [B, H, K, D_head/2]
+    sin = sin_table[indices]                      # [B, H, K, D_head/2]
+
+    x_left = x[..., : D_head // 2]
+    x_right = x[..., D_head // 2 :]
 
     rotates_left = x_left * cos - x_right * sin
     rotates_right = x_right * cos + x_left * sin
@@ -149,7 +165,7 @@ def apply_rotary_emb_3d(
 
 
 class BatchedSparseAttentionBlock(nn.Module):
-    """Processes gathered dynamic sparse tokens [B, K, D] with standard scaled dot-product attention."""
+    """Processes dynamic sparse tokens using GQA & Per-KV Head Routing."""
 
     def __init__(
         self, d_model: int, num_q_heads: int, num_kv_heads: int, window_size: int = 8
@@ -167,8 +183,14 @@ class BatchedSparseAttentionBlock(nn.Module):
         ), "num_q_heads must be divisible by num_kv_heads"
 
         self.num_q_per_kv = num_q_heads // num_kv_heads
-        self.router = BatchedRouter(
-            n_embd=d_model, base_k=4, block_size=4, rank=4, alpha=0.01
+
+        self.router = PerKVHeadRouter(
+            head_dim=self.head_dim,
+            num_kv_heads=num_kv_heads,
+            base_k=4,
+            block_size=4,
+            rank=4,
+            alpha=0.01,
         )
 
         self.q_proj = nn.Linear(d_model, num_q_heads * self.head_dim)
@@ -184,76 +206,91 @@ class BatchedSparseAttentionBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # x shape: [B, S, D]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, S, D = x.size()
         shortcut = x
 
-        # 1. Router Selection
-        selected_indices, selected_weights, aux_loss = self.router(
-            x, window_size=self.window_size
-        )                                                         # [B, K]
-        K_len = selected_indices.size(1)
-
-        # 2. Gather dynamic tokens: [B, S, D] -> [B, K, D]
-        gather_idx = selected_indices.unsqueeze(-1).expand(B, K_len, D)
-        x_sparse = torch.gather(x, dim=1, index=gather_idx)
-
-        # 3. Projections
-        q = (
-            self.q_proj(x_sparse)
-            .view(B, K_len, self.num_q_heads, self.head_dim)
+        # 1. Full Sequence Projections
+        q_full = (
+            self.q_proj(x)
+            .view(B, S, self.num_q_heads, self.head_dim)
             .transpose(1, 2)
-        )                                                         # [B, H_q, K, D_head]
-        k = (
-            self.k_proj(x_sparse)
-            .view(B, K_len, self.num_kv_heads, self.head_dim)
+        )                                                           # [B, H_q, S, D_head]
+        k_full = (
+            self.k_proj(x)
+            .view(B, S, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
-        )                                                         # [B, H_kv, K, D_head]
-        v = (
-            self.v_proj(x_sparse)
-            .view(B, K_len, self.num_kv_heads, self.head_dim)
+        )                                                           # [B, H_kv, S, D_head]
+        v_full = (
+            self.v_proj(x)
+            .view(B, S, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
-        )                                                         # [B, H_kv, K, D_head]
+        )                                                           # [B, H_kv, S, D_head]
 
-        q = apply_rotary_emb_3d(q, cos, sin)
-        k = apply_rotary_emb_3d(k, cos, sin)
+        # 2. Per-KV Head Router Selection
+        kv_indices, kv_weights, aux_loss, routing_entropy = self.router(
+            k_full, window_size=self.window_size
+        )                                                           # [B, H_kv, K]
 
-        k = k.repeat_interleave(self.num_q_per_kv, dim=1)
-        v = v.repeat_interleave(self.num_q_per_kv, dim=1)
+        K_len = kv_indices.size(-1)
 
-        # 4. Scaled Dot-Product Attention
+        # 3. Gather KV States
+        kv_gather_idx = kv_indices.unsqueeze(-1).expand(
+            B, self.num_kv_heads, K_len, self.head_dim
+        )
+        k_sparse = torch.gather(k_full, dim=2, index=kv_gather_idx)  # [B, H_kv, K, D_head]
+        v_sparse = torch.gather(v_full, dim=2, index=kv_gather_idx)  # [B, H_kv, K, D_head]
+
+        # Expand KV Head Indices & Weights to Query Head Space
+        q_indices = kv_indices.repeat_interleave(self.num_q_per_kv, dim=1)  # [B, H_q, K]
+        q_weights = kv_weights.repeat_interleave(self.num_q_per_kv, dim=1)  # [B, H_q, K]
+
+        # Gather Query States mapped to matched KV selections
+        q_gather_idx = q_indices.unsqueeze(-1).expand(
+            B, self.num_q_heads, K_len, self.head_dim
+        )
+        q_sparse = torch.gather(q_full, dim=2, index=q_gather_idx)   # [B, H_q, K, D_head]
+
+        # 4. RoPE
+        q = apply_rotary_emb_indexed(q_sparse, cos, sin, q_indices)
+        k = apply_rotary_emb_indexed(k_sparse, cos, sin, kv_indices)
+
+        # Expand KV to match Query Head count for GQA attention calculation
+        k = k.repeat_interleave(self.num_q_per_kv, dim=1)            # [B, H_q, K, D_head]
+        v = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)     # [B, H_q, K, D_head]
+
+        # 5. Scaled Dot-Product Attention
         raw_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim**0.5)
 
-        # Causal mask [1, 1, K, K]
-        row_idx = torch.arange(K_len, device=x.device).unsqueeze(1)
-        col_idx = torch.arange(K_len, device=x.device).unsqueeze(0)
-        causal_mask = (row_idx - col_idx) < 0
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        # Strict Causal Masking on original sequence position indices
+        # Mask out target positions (keys) that appear strictly after query positions
+        kv_indices_q = kv_indices.repeat_interleave(self.num_q_per_kv, dim=1)
+        causal_mask = q_indices.unsqueeze(-1) < kv_indices_q.unsqueeze(-2)  # [B, H_q, K, K]
 
         masked_scores = raw_scores.masked_fill(causal_mask, float("-inf"))
         attention_weights = F.softmax(masked_scores, dim=-1)
         attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
 
-        attention_output = torch.matmul(attention_weights, v)     # [B, H, K, D_head]
+        attention_output = torch.matmul(attention_weights, v)       # [B, H_q, K, D_head]
 
-        # 5. Output projection and feedforward
+        # Apply STE weights
+        weighted_output = attention_output * q_weights.unsqueeze(-1)
+
+        # 6. Scatter-add back to full sequence query space [B, H_q, S, D_head]
+        output_full = torch.zeros_like(q_full)
+        output_full.scatter_add_(dim=2, index=q_gather_idx, src=weighted_output)
+
+        # Output projection and feedforward
         stitched = (
-            attention_output.transpose(1, 2)
+            output_full.transpose(1, 2)
             .contiguous()
-            .view(B, K_len, self.d_model)
+            .view(B, S, self.d_model)
         )
         blended = self.out_proj(stitched)
         math_output = self.layer_block(blended)
 
-        weighted_output = math_output * selected_weights.unsqueeze(-1)
-
-        # 6. Scatter add back to full context tensor [B, S, D]
-        output = torch.zeros_like(x)
-        output.scatter_add_(dim=1, index=gather_idx, src=weighted_output)
-
-        final_output = output + shortcut
-        return self.norm(final_output), aux_loss
+        final_output = math_output + shortcut
+        return self.norm(final_output), aux_loss, routing_entropy
 
 
 class BatchedSparseTransformer(nn.Module):
@@ -290,18 +327,22 @@ class BatchedSparseTransformer(nn.Module):
 
         self.register_buffer(
             "cos_cached", torch.cos(angles).unsqueeze(0).unsqueeze(0), persistent=False
-        )                                                         # [1, 1, S, D/2]
+        )                                                           # [1, 1, S, D/2]
         self.register_buffer(
             "sin_cached", torch.sin(angles).unsqueeze(0).unsqueeze(0), persistent=False
-        )                                                         # [1, 1, S, D/2]
+        )                                                           # [1, 1, S, D/2]
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # x shape: [B, S, D]
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_entropy = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
         for layer_module in self.layer:
-            x, aux_loss = layer_module(x, self.cos_cached, self.sin_cached)
+            x, aux_loss, routing_entropy = layer_module(x, self.cos_cached, self.sin_cached)
             total_aux_loss = total_aux_loss + aux_loss
-        return x, total_aux_loss
+            total_entropy = total_entropy + routing_entropy
+
+        avg_entropy = total_entropy / len(self.layer)
+        return x, total_aux_loss, avg_entropy
 
 
 def verify_batched_causal_leakage(
@@ -310,12 +351,11 @@ def verify_batched_causal_leakage(
     model.zero_grad()
 
     x = torch.randn(batch_size, seq_len, d_model, requires_grad=True)
-    output, _ = model(x)
+    output, _, _ = model(x)
 
     target_batch_idx = 0
     target_token_idx = 5
 
-    # Isolate loss calculation to target token
     grad_projection = torch.randn_like(output[target_batch_idx, target_token_idx])
     target_loss = (
         output[target_batch_idx, target_token_idx] * grad_projection
@@ -347,8 +387,39 @@ def verify_batched_causal_leakage(
     )
 
 
+def test_routing_entropy_across_sequence_lengths(
+    model: nn.Module, batch_size: int = 4, d_model: int = 16
+):
+    seq_lengths = [16, 32, 64, 128, 256, 512]
+    model.eval()
+
+    print("\n--- Routing Entropy Test Across Sequence Lengths ---")
+    print(f"{'Seq Len':>8} | {'Selected K':>10} | {'Sparsity %':>10} | {'Avg Routing Entropy (bits)':>28}")
+    print("-" * 68)
+
+    with torch.no_grad():
+        for S in seq_lengths:
+            x = torch.randn(batch_size, S, d_model)
+            _, _, avg_entropy = model(x)
+
+            first_block = model.layer[0]
+            k_full = (
+                first_block.k_proj(x)
+                .view(batch_size, S, first_block.num_kv_heads, first_block.head_dim)
+                .transpose(1, 2)
+            )
+            selected_indices, _, _, _ = first_block.router(k_full, window_size=first_block.window_size)
+            selected_k = selected_indices.size(-1)
+            sparsity = (1.0 - (selected_k / S)) * 100.0
+
+            entropy_val = avg_entropy.item()
+            print(f"{S:8d} | {selected_k:10d} | {sparsity:9.1f}% | {entropy_val:28.6f}")
+
+    print("✅ Routing Entropy Evaluation Complete.")
+
+
 if __name__ == "__main__":
-    torch.manual_seed(706)
+    torch.manual_seed(78776)
 
     BATCH_SIZE = 4
     SEQ_LEN = 16
@@ -361,6 +432,7 @@ if __name__ == "__main__":
         num_q_heads=8,
         num_kv_heads=2,
         window_size=8,
+        max_seq_len=2048,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
@@ -374,7 +446,7 @@ if __name__ == "__main__":
 
         current_temp = scheduler.step(step)
 
-        output, total_aux_loss = model(x)
+        output, total_aux_loss, avg_entropy = model(x)
         target = torch.randn_like(output)
         task_loss = F.mse_loss(output, target)
         loss = task_loss + total_aux_loss
@@ -396,9 +468,14 @@ if __name__ == "__main__":
                 f"Step {step:2d} | "
                 f"Temp: {current_temp:.4f} | "
                 f"Total Loss: {loss.item():.4f} | "
+                f"Routing Entropy: {avg_entropy.item():.4f} | "
                 f"Gate Down Grad: {gate_down_grad.norm().item():.6f}"
             )
 
     verify_batched_causal_leakage(
         model, batch_size=BATCH_SIZE, seq_len=SEQ_LEN, d_model=D_MODEL
+    )
+
+    test_routing_entropy_across_sequence_lengths(
+        model, batch_size=BATCH_SIZE, d_model=D_MODEL
     )

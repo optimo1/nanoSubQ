@@ -62,9 +62,9 @@
 ---
 
 ## 5. Algorithmic Bounds & Attention Economics
-- [ ] **Dynamic $k$-Scaling Boundaries:** Formalize and test log-scale routing bounds ($k = \Theta(\log_2 S)$) to guarantee sub-quadratic compute scaling while keeping a constant lower bound ($k \ge 1$) for context retrieval.
-- [ ] **Sequence Length Invariance & Stress Testing:** Evaluate routing entropy and top-$k$ sparsity stability across drastically different context lengths (e.g., $S=64$ vs. $S=4096$) without retuning temperature hyper-parameters.
-- [ ] **Multi-Head Routing Strategies:** Compare **Shared Sequence-Level Routing** (single router per layer, used in `nanoSubQ`) against **Per-Head Independent Routing** ($H$ distinct gating matrices), quantifying memory vs. expressiveness trade-offs.
+- [done] **Dynamic $k$-Scaling Boundaries:** Formalize and test log-scale routing bounds ($k = \Theta(\log_2 S)$) to guarantee sub-quadratic compute scaling while keeping a constant lower bound ($k \ge 1$) for context retrieval.
+- [done] **Sequence Length Invariance & Stress Testing:** Evaluate routing entropy and top-$k$ sparsity stability across drastically different context lengths (e.g., $S=64$ vs. $S=4096$) without retuning temperature hyper-parameters.
+- [done] **Multi-Head Routing Strategies:** Compare **Shared Sequence-Level Routing** (single router per layer, used in `nanoSubQ`) against **Per-Head Independent Routing** ($H$ distinct gating matrices), quantifying memory vs. expressiveness trade-offs.
 
 ---
 
