@@ -74,9 +74,45 @@
 
 ---
 
-## 🟥 Phase 5: Learn How to Hack & Control nanoGPT
-- [ ] **Learn This:** The structure of Andrej Karpathy's `model.py`—locating where the text flows into the core attention loops[cite: 4].
-- [ ] **Learn That:** Code refactoring—how to safely swap out the original dense `CausalSelfAttention` module and plug in your custom sparse gating module[cite: 4].
-- [ ] **Learn This:** Character-level token prep—how text datasets (like Shakespeare) are converted into raw integer arrays for training[cite: 4].
-- [ ] **Learn That:** STE training dynamics—why you must set a lower learning rate (`3e-4`), turn off routing layer biases, and use gradient clipping to prevent gradient explosions[cite: 4].
-- [ ] **Learn This:** Linear Scaling Performance—how to monitor validation loss and track VRAM usage to confirm your model successfully achieves linear $O(N \cdot k)$ efficiency[cite: 4].
+# Phase 5: Hacking, Integrating & Training nanoGPT
+
+## 1. Model Architecture & Refactoring (`model.py`)
+- [ ] **Deconstruct `CausalSelfAttention`:** Study the tensor flows, projection matrices ($W_q, W_k, W_v, W_o$), and scale dot-product attention calculation in original nanoGPT.
+- [ ] **Inject `SubQAttention` Module:** Replace standard dense self-attention with your custom `SubQAttention` containing the `PerKVHeadRouter`.
+- [ ] **Hook Up Dynamic KV Token Selection:** Pass input sequence tokens through your router to compute top-$K$ indices, dynamically pruning 50–70% of non-essential Key-Value pairs before score computation.
+- [ ] **Pass Through Straight-Through Estimator (STE):** Maintain non-differentiable top-$K$ discrete selection on the forward pass while routing continuous gradients backward to update the router logits.
+- [ ] **Aggregate Auxiliary Loss:** Modify `GPT.forward()` to return both task cross-entropy loss and router loss (`total_loss = cross_entropy_loss + router_aux_loss`).
+- [ ] **Build Pre-allocated KV-Cache:** Implement KV-caching with sparse indexing support to speed up autoregressive decoding during `model.generate()`.
+
+---
+
+## 2. Dataset Pipeline & Chat Tuning
+- [ ] **Dataset Curation:** Select a compact, high-quality instruction dataset (e.g., SmolTalk, UltraChat 200k, or a subset of OpenHermes) to teach conversational behavior.
+- [ ] **Implement ChatML Templates:** Format text data into structured conversation tokens using standard delimiters:
+  ```text
+  <|im_start|>user
+  Question here...<|im_end|>
+  <|im_start|>assistant
+  Answer here...<|im_end|>
+  ```
+- [ ] **BPE Tokenization (`tiktoken`):** Set up tokenization scripts to encode ChatML-formatted strings into raw integer numpy `.bin` arrays for fast disk-to-GPU loading.
+- [ ] **Supervised Loss Masking:** Modify dataset loading in `train.py` so cross-entropy loss is computed **only on assistant response tokens**, ignoring user prompt tokens (`ignore_index = -100`).
+
+---
+
+## 3. STE Training Dynamics & Stabilization (`train.py`)
+- [ ] **Disable Router Biases:** Set `bias=False` on router linear projections to prevent baseline logit shifts from unbalancing STE selection.
+- [ ] **Hyperparameter Configuration:**
+  - Set learning rate to `3e-4` with a cosine decay schedule.
+  - Set AdamW weight decay to `0.1` (applying `0.0` decay to router logit clamps and temperature params).
+- [ ] **Enforce Safety Guardrails:**
+  - Apply **Logit Clamping** (`clamp_val=4.0`) inside the router to prevent Sigmoid derivative vanishing.
+  - Enable **Gradient Clipping** (`torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)`) to block gradient explosions during STE temperature decay.
+- [ ] **Temperature & Entropy Schedules:** Implement exponential temperature decay ($T = 2.0 \to 0.1$) alongside binary entropy tracking to monitor router convergence from soft exploration to sharp selection.
+
+---
+
+## 4. Verification, Benchmarking & Performance
+- [ ] **Overfitting Sanity Check:** Train on a single small batch (64 tokens) for 100 steps to confirm loss drops near $0.0$ and STE gradients update router weights properly.
+- [ ] **Verify Linear Complexity $O(N \cdot K)$:** Measure memory footprint (VRAM usage) and execution time across growing context lengths ($N = 512 \to 2048$), confirming scale advantages over standard $O(N^2)$ attention.
+- [ ] **Chatbot Inference Test:** Run `model.generate()` using temperature (`0.7`) and top-$p$ (`0.9`) sampling with a system prompt to verify coherent, fast multi-turn responses.
