@@ -77,8 +77,8 @@
 # Phase 5: Hacking, Integrating & Training nanoGPT
 
 ## 1. Model Architecture & Refactoring (`model.py`)
-- [ ] **Deconstruct `CausalSelfAttention`:** Study the tensor flows, projection matrices ($W_q, W_k, W_v, W_o$), and scale dot-product attention calculation in original nanoGPT.
-- [ ] **Inject `SubQAttention` Module:** Replace standard dense self-attention with your custom `SubQAttention` containing the `PerKVHeadRouter`.
+- [done] **Deconstruct `CausalSelfAttention`:** Study the tensor flows, projection matrices ($W_q, W_k, W_v, W_o$), and scale dot-product attention calculation in original nanoGPT.
+- [done] **Inject `SubQAttention` Module:** Replace standard dense self-attention with your custom `SubQAttention` containing the `PerKVHeadRouter`.
 - [ ] **Hook Up Dynamic KV Token Selection:** Pass input sequence tokens through your router to compute top-$K$ indices, dynamically pruning 50–70% of non-essential Key-Value pairs before score computation.
 - [ ] **Pass Through Straight-Through Estimator (STE):** Maintain non-differentiable top-$K$ discrete selection on the forward pass while routing continuous gradients backward to update the router logits.
 - [ ] **Aggregate Auxiliary Loss:** Modify `GPT.forward()` to return both task cross-entropy loss and router loss (`total_loss = cross_entropy_loss + router_aux_loss`).
