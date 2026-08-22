@@ -69,8 +69,8 @@
 ---
 
 ## 6. Training Dynamics & Convergence
-- [ ] **Routing Gradient Explosion / Vanishing:** Monitor gradient norms ($\|\nabla_{W} \mathcal{L}\|$) through the STE layer during early training steps to detect gradient saturation or spike instabilities.
-- [ ] **Entropy Regularization:** Experiment with router score entropy penalties ($-\sum P_i \log P_i$) to control router sharpness and prevent premature convergence to deterministic binary gates.
+- [done] **Routing Gradient Explosion / Vanishing:** Monitor gradient norms ($\|\nabla_{W} \mathcal{L}\|$) through the STE layer during early training steps to detect gradient saturation or spike instabilities.
+- [done] **Entropy Regularization:** Experiment with router score entropy penalties ($-\sum P_i \log P_i$) to control router sharpness and prevent premature convergence to deterministic binary gates.
 
 ---
 

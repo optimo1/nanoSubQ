@@ -46,14 +46,20 @@ class PerKVHeadRouter(nn.Module):
         init_temperature: float = 2.0,
         min_temperature: float = 0.1,
         alpha: float = 0.01,
+        clamp_val: float = 4.0,  # Prevents Sigmoid saturation
     ):
         super().__init__()
         self.base_k = base_k
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
+        self.clamp_val = clamp_val
 
         self.gate_down = nn.Linear(head_dim, rank, bias=False)
         self.gate_up = nn.Linear(rank, 1, bias=False)
+
+        # Small std dev init: keeps initial logits near 0.0 (high slope region)
+        nn.init.normal_(self.gate_down.weight, std=0.01)
+        nn.init.normal_(self.gate_up.weight, std=0.01)
 
         self.temperature = init_temperature
         self.min_temperature = min_temperature
@@ -91,7 +97,11 @@ class PerKVHeadRouter(nn.Module):
         bottleneck = self.gate_down(k_states)                       # [B, H_kv, S, rank]
         raw_scores = self.gate_up(bottleneck).squeeze(-1)           # [B, H_kv, S]
 
-        norm_scores = torch.sigmoid(raw_scores / self.temperature)
+        # Logit Clamping (Forward Normalization): Prevents Gradient Vanishing
+        scaled_logits = raw_scores / self.temperature
+        clamped_logits = torch.clamp(scaled_logits, min=-self.clamp_val, max=self.clamp_val)
+        norm_scores = torch.sigmoid(clamped_logits)
+
         P = norm_scores.mean()
 
         routing_entropy = self.calculate_routing_entropy(norm_scores)
@@ -191,6 +201,7 @@ class BatchedSparseAttentionBlock(nn.Module):
             block_size=4,
             rank=4,
             alpha=0.01,
+            clamp_val=4.0,
         )
 
         self.q_proj = nn.Linear(d_model, num_q_heads * self.head_dim)
@@ -263,7 +274,6 @@ class BatchedSparseAttentionBlock(nn.Module):
         raw_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # Strict Causal Masking on original sequence position indices
-        # Mask out target positions (keys) that appear strictly after query positions
         kv_indices_q = kv_indices.repeat_interleave(self.num_q_per_kv, dim=1)
         causal_mask = q_indices.unsqueeze(-1) < kv_indices_q.unsqueeze(-2)  # [B, H_q, K, K]
 
@@ -419,7 +429,7 @@ def test_routing_entropy_across_sequence_lengths(
 
 
 if __name__ == "__main__":
-    torch.manual_seed(78776)
+    torch.manual_seed(7496)
 
     BATCH_SIZE = 4
     SEQ_LEN = 16
@@ -454,7 +464,12 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         loss.backward()
 
+        # Global model gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Dedicated Router Gradient Clipping (Backward Normalization): Prevents Gradient Explosions
+        router_params = [p for layer in model.layer for p in layer.router.parameters()]
+        torch.nn.utils.clip_grad_norm_(router_params, max_norm=0.5)
 
         first_layer = model.layer[0]
         assert isinstance(first_layer, BatchedSparseAttentionBlock)
