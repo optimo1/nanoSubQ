@@ -33,13 +33,13 @@ def apply_rotary_emb_indexed(
     sin_cached: torch.Tensor, 
     indices: torch.Tensor
 ) -> torch.Tensor:
-    B, H, K, D_head = x.shape
-    cos_table = cos_cached.squeeze(0).squeeze(0)
-    sin_table = sin_cached.squeeze(0).squeeze(0)
+    cos_table = cos_cached.squeeze(0).squeeze(0)  # [max_seq_len, head_dim // 2]
+    sin_table = sin_cached.squeeze(0).squeeze(0)  # [max_seq_len, head_dim // 2]
 
-    cos = cos_table[indices]
-    sin = sin_table[indices]
+    cos = cos_table[indices]  # [B, H, K_len, head_dim // 2]
+    sin = sin_table[indices]  # [B, H, K_len, head_dim // 2]
 
+    D_head = x.size(-1)
     x_left = x[..., : D_head // 2]
     x_right = x[..., D_head // 2 :]
 
@@ -65,7 +65,8 @@ class PerKVHeadRouter(nn.Module):
         head_dim: int,
         num_kv_heads: int,
         rank: int = 4,
-        base_k: int = 4,
+        retention_ratio: float = 0.40,  # Retain 40% (prune 60%)
+        min_k: int = 16,
         block_size: int = 4,
         init_temperature: float = 2.0,
         min_temperature: float = 0.1,
@@ -73,7 +74,8 @@ class PerKVHeadRouter(nn.Module):
         clamp_val: float = 4.0,
     ):
         super().__init__()
-        self.base_k = base_k
+        self.retention_ratio = retention_ratio
+        self.min_k = min_k
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
         self.clamp_val = clamp_val
@@ -93,16 +95,19 @@ class PerKVHeadRouter(nn.Module):
     def set_temperature(self, new_temp: float):
         self.temperature = max(new_temp, self.min_temperature)
 
-    def calculate_k(self, seq_len: int) -> int:
-        if seq_len <= self.block_size:
-            return seq_len
+    def calculate_k(self, hist_len: int) -> int:
+        if hist_len <= self.block_size:
+            return hist_len
 
-        log_factor = math.log2(seq_len)
-        raw_k = int(self.base_k * log_factor)
+        raw_k = int(hist_len * self.retention_ratio)
+        k_bounded = max(self.min_k, raw_k)
+        k_bounded = min(k_bounded, hist_len)
+
         optimized_k = (
-            (raw_k + self.block_size - 1) // self.block_size
+            (k_bounded + self.block_size - 1) // self.block_size
         ) * self.block_size
-        return min(optimized_k, seq_len)
+
+        return min(optimized_k, hist_len)
 
     def forward(
         self, k_states: torch.Tensor, window_size: int = 8
@@ -155,6 +160,44 @@ class PerKVHeadRouter(nn.Module):
         return selected_indices, selected_weights, aux_loss, routing_entropy
 
 
+class SparseKVCache(nn.Module):
+    """Pre-allocated static KV-cache buffer with sparse index routing support."""
+    def __init__(self, batch_size: int, num_kv_heads: int, max_seq_len: int, head_dim: int, device: torch.device, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.batch_size = batch_size
+        self.num_kv_heads = num_kv_heads
+        self.max_seq_len = max_seq_len
+        self.head_dim = head_dim
+        
+        # Static buffer pre-allocation
+        shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
+        self.register_buffer("k_cache", torch.zeros(shape, dtype=dtype, device=device), persistent=False)
+        self.register_buffer("v_cache", torch.zeros(shape, dtype=dtype, device=device), persistent=False)
+        self.seq_pos = 0
+
+    def update(self, k_val: torch.Tensor, v_val: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        k_val, v_val: [B, H_kv, T_new, D_head]
+        Appends new K/V projections into the pre-allocated cache tensor.
+        """
+        bsz, num_heads, t_new, head_dim = k_val.shape
+        end_pos = self.seq_pos + t_new
+        
+        self.k_cache[:, :, self.seq_pos:end_pos, :] = k_val
+        self.v_cache[:, :, self.seq_pos:end_pos, :] = v_val
+        self.seq_pos = end_pos
+
+        k_active = self.k_cache[:, :, :self.seq_pos, :]
+        v_active = self.v_cache[:, :, :self.seq_pos, :]
+        return k_active, v_active
+
+    def reset(self):
+        """Clears sequence offset and resets cache buffers for next generation pass."""
+        self.seq_pos = 0
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+
+
 class MLP(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
@@ -191,7 +234,8 @@ class BatchedSparseAttentionBlock(nn.Module):
         self.router = PerKVHeadRouter(
             head_dim=self.head_dim,
             num_kv_heads=num_kv_heads,
-            base_k=4,
+            retention_ratio=0.40,
+            min_k=16,
             block_size=4,
             rank=4,
             alpha=0.01,
@@ -208,7 +252,7 @@ class BatchedSparseAttentionBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(d_model)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, kv_cache: SparseKVCache = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x_norm = self.ln_1(x)
         B, S, D = x_norm.size()
@@ -218,16 +262,21 @@ class BatchedSparseAttentionBlock(nn.Module):
             .view(B, S, self.num_q_heads, self.head_dim)
             .transpose(1, 2)
         )
-        k_full = (
+        k_step = (
             self.k_proj(x_norm)
             .view(B, S, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
         )
-        v_full = (
+        v_step = (
             self.v_proj(x_norm)
             .view(B, S, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
         )
+
+        if kv_cache is not None:
+            k_full, v_full = kv_cache.update(k_step, v_step)
+        else:
+            k_full, v_full = k_step, v_step
 
         kv_indices, kv_weights, aux_loss, routing_entropy = self.router(
             k_full, window_size=self.window_size
@@ -241,13 +290,20 @@ class BatchedSparseAttentionBlock(nn.Module):
         k_sparse = torch.gather(k_full, dim=2, index=kv_gather_idx)
         v_sparse = torch.gather(v_full, dim=2, index=kv_gather_idx)
 
-        q_indices = kv_indices.repeat_interleave(self.num_q_per_kv, dim=1)
-        q_weights = kv_weights.repeat_interleave(self.num_q_per_kv, dim=1)
+        # Handle Query position indexing for single decoding step vs. prompt evaluation
+        if kv_cache is not None and S == 1:
+            curr_pos = kv_cache.seq_pos - 1
+            q_indices = torch.full((B, self.num_q_heads, 1), curr_pos, device=x.device, dtype=torch.long)
+            q_sparse = q_full
+            q_weights = torch.ones_like(q_indices, dtype=x.dtype)
+        else:
+            q_indices = kv_indices.repeat_interleave(self.num_q_per_kv, dim=1)
+            q_weights = kv_weights.repeat_interleave(self.num_q_per_kv, dim=1)
 
-        q_gather_idx = q_indices.unsqueeze(-1).expand(
-            B, self.num_q_heads, K_len, self.head_dim
-        )
-        q_sparse = torch.gather(q_full, dim=2, index=q_gather_idx)
+            q_gather_idx = q_indices.unsqueeze(-1).expand(
+                B, self.num_q_heads, K_len, self.head_dim
+            )
+            q_sparse = torch.gather(q_full, dim=2, index=q_gather_idx)
 
         q = apply_rotary_emb_indexed(q_sparse, cos, sin, q_indices)
         k = apply_rotary_emb_indexed(k_sparse, cos, sin, kv_indices)
@@ -266,16 +322,23 @@ class BatchedSparseAttentionBlock(nn.Module):
 
         attention_output = torch.matmul(attention_weights, v)
 
-        weighted_output = attention_output * q_weights.unsqueeze(-1)
+        if kv_cache is not None and S == 1:
+            stitched = (
+                attention_output.transpose(1, 2)
+                .contiguous()
+                .view(B, S, self.d_model)
+            )
+        else:
+            weighted_output = attention_output * q_weights.unsqueeze(-1)
+            output_full = torch.zeros_like(q_full)
+            output_full.scatter_add_(dim=2, index=q_gather_idx, src=weighted_output)
 
-        output_full = torch.zeros_like(q_full)
-        output_full.scatter_add_(dim=2, index=q_gather_idx, src=weighted_output)
-
-        stitched = (
-            output_full.transpose(1, 2)
-            .contiguous()
-            .view(B, S, self.d_model)
-        )
+            stitched = (
+                output_full.transpose(1, 2)
+                .contiguous()
+                .view(B, S, self.d_model)
+            )
+            
         attn_out = self.out_proj(stitched)
         
         x = x + attn_out
@@ -347,7 +410,7 @@ class SparseGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, kv_caches: list[SparseKVCache] = None):
         device = idx.device
         b, t = idx.size()
 
@@ -357,8 +420,9 @@ class SparseGPT(nn.Module):
         total_aux_loss = torch.tensor(0.0, device=device, dtype=x.dtype)
         total_entropy = torch.tensor(0.0, device=device, dtype=x.dtype)
 
-        for block in self.transformer.h:
-            x, aux_loss, routing_entropy = block(x, self.cos_cached, self.sin_cached)
+        for i, block in enumerate(self.transformer.h):
+            cache = kv_caches[i] if kv_caches is not None else None
+            x, aux_loss, routing_entropy = block(x, self.cos_cached, self.sin_cached, kv_cache=cache)
             total_aux_loss = total_aux_loss + aux_loss
             total_entropy = total_entropy + routing_entropy
 
@@ -376,17 +440,44 @@ class SparseGPT(nn.Module):
         return logits, loss, avg_entropy
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None):
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
-            logits, _, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None, use_cache: bool = True, generator: torch.Generator = None):
+        if use_cache:
+            batch_size = idx.size(0)
+            kv_caches = [
+                SparseKVCache(
+                    batch_size=batch_size,
+                    num_kv_heads=self.config.num_kv_heads,
+                    max_seq_len=self.config.max_seq_len,
+                    head_dim=self.head_dim,
+                    device=idx.device,
+                    dtype=self.transformer.wte.weight.dtype
+                )
+                for _ in range(self.config.num_layers)
+            ]
+            
+            logits, _, _ = self(idx, kv_caches=kv_caches)
+            
+            for _ in range(max_new_tokens):
+                step_logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
+                    step_logits[step_logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(step_logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1, generator=generator)
+                idx = torch.cat((idx, idx_next), dim=1)
+                
+                logits, _, _ = self(idx_next, kv_caches=kv_caches)
+        else:
+            for _ in range(max_new_tokens):
+                idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
+                logits, _, _ = self(idx_cond)
+                step_logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
+                    step_logits[step_logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(step_logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1, generator=generator)
+                idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
 
@@ -398,7 +489,6 @@ class SparseGPT(nn.Module):
 def run_tests():
     print("Running verification tests...")
 
-    # Configuration for small test instance
     config = SparseGPTConfig(
         vocab_size=1000,
         max_seq_len=128,
@@ -423,7 +513,7 @@ def run_tests():
     # Test 2: PerKVHeadRouter Selection & Dimensions
     head_dim = config.d_model // config.num_q_heads
     router = PerKVHeadRouter(head_dim=head_dim, num_kv_heads=config.num_kv_heads)
-    mock_k = torch.randn(2, config.num_kv_heads, 32, head_dim) # [B=2, H_kv=2, S=32, D_head=16]
+    mock_k = torch.randn(2, config.num_kv_heads, 32, head_dim)
     indices, weights, aux_loss, entropy = router(mock_k, window_size=8)
     assert indices.shape[0] == 2 and indices.shape[1] == config.num_kv_heads, "Router index dimensions incorrect"
     assert weights.shape == indices.shape, "Router weights shape mismatch"
@@ -450,7 +540,7 @@ def run_tests():
 
     # Test 5: Inference Generation Loop
     prompt = torch.randint(0, config.vocab_size, (1, 8))
-    generated = model.generate(prompt, max_new_tokens=5, temperature=1.0, top_k=10)
+    generated = model.generate(prompt, max_new_tokens=5, temperature=1.0, top_k=10, use_cache=False)
     assert generated.shape == (1, 13), f"Expected output shape (1, 13), got {generated.shape}"
     print("Test 5 Passed: Autoregressive token generation verified.")
 
@@ -459,6 +549,29 @@ def run_tests():
     new_t = scheduler.step(current_step=50)
     assert new_t < 2.0 and new_t > 0.1, "Temperature annealing step failed"
     print("Test 6 Passed: TemperatureScheduler functioning properly.")
+
+    # Test 7: Verify KV Token Pruning Ratio
+    seq_len = 128
+    window_size = 8
+    router_test = PerKVHeadRouter(head_dim=16, num_kv_heads=2, retention_ratio=0.40)
+    test_k = torch.randn(1, 2, seq_len, 16)
+    indices, _, _, _ = router_test(test_k, window_size=window_size)
+    retained_tokens = indices.size(-1)
+    pruning_ratio = (1.0 - (retained_tokens / seq_len)) * 100
+    assert 50.0 <= pruning_ratio <= 70.0, f"Pruning ratio {pruning_ratio:.2f}% outside expected target range!"
+    print(f"Test 7 Passed: Retained {retained_tokens}/{seq_len} tokens. Pruning Ratio = {pruning_ratio:.2f}%")
+
+    # Test 8: Pre-allocated SparseKVCache Generation Match
+    prompt_cache = torch.randint(0, config.vocab_size, (1, 8))
+    
+    g_cached = torch.Generator(device=prompt_cache.device).manual_seed(42)
+    gen_cached = model.generate(prompt_cache.clone(), max_new_tokens=4, temperature=0.1, use_cache=True, generator=g_cached)
+    
+    g_uncached = torch.Generator(device=prompt_cache.device).manual_seed(42)
+    gen_uncached = model.generate(prompt_cache.clone(), max_new_tokens=4, temperature=0.1, use_cache=False, generator=g_uncached)
+    
+    assert torch.equal(gen_cached, gen_uncached), "Cached and uncached generation outputs do not match!"
+    print("Test 8 Passed: Pre-allocated SparseKVCache generation matches standard decoding.")
 
     print("\nAll integration tests completed successfully!")
 
