@@ -7,23 +7,37 @@ import torch.nn as nn
 from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
 
 # -----------------------------------------------------------------------------
-# Config & Hyperparameters (Small Model Run)
+# Config & Hyperparameters
 # -----------------------------------------------------------------------------
 data_dir = 'data'
 out_dir = 'out'
-batch_size = 32      # Increased batch size for better gradient stability
-block_size = 512     # Extended context window length
-max_iters = 5000     # Longer training run for convergence
-eval_interval = 250
+batch_size = 32      
+block_size = 512     
+tokens_per_batch = batch_size * block_size  # 16,384 tokens per iteration
+
+# Load binary dataset mappings
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
+# Calculate exact iterations required for 1 full epoch
+tokens_in_train = len(train_data)
+max_iters = tokens_in_train // tokens_per_batch
+
+print(f"Total tokens in train.bin: {tokens_in_train:,}")
+print(f"Batch size in tokens: {tokens_per_batch:,}")
+print(f"Calculated iterations for 1 full epoch: {max_iters:,} steps")
+
+# Set evaluation and log intervals relative to calculated training length
+eval_interval = max(100, max_iters // 20)  # Log ~20 validation evaluations across run
 log_interval = 20
 eval_iters = 50
 
 # Learning Rate & Optimizer Config
-learning_rate = 6e-4 # Slightly higher base LR for smaller architecture scale
-min_lr = 6e-5        # 10% decay minimum
+learning_rate = 6e-4 
+min_lr = 6e-5        
 weight_decay = 0.1
-warmup_iters = 250   # Scaled warmup steps
-max_grad_norm = 1.0  # Stable gradient clipping threshold
+warmup_iters = min(2000, int(max_iters * 0.05)) # Warmup over 5% of training
+max_grad_norm = 1.0  
 
 # Temperature Schedule Config (Exponential Decay: 2.0 -> 0.1)
 t_max = 2.0
@@ -34,10 +48,10 @@ t_decay_rate = 3.0
 config = nanoSubQConfig(
     vocab_size=50304,
     max_seq_len=block_size,
-    d_model=384,        # 384 / 6 heads = 64 head_dim
-    num_layers=6,       # 6 Transformer blocks
-    num_q_heads=6,      # Divisible by num_kv_heads (6 / 2 = 3)
-    num_kv_heads=2,      # Grouped Query Attention ratio
+    d_model=384,        
+    num_layers=6,       
+    num_q_heads=6,      
+    num_kv_heads=2,      
     window_size=8,
     dropout=0.0,
 )
@@ -45,12 +59,6 @@ config = nanoSubQConfig(
 device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 print(f"Using device: {device}")
 os.makedirs(out_dir, exist_ok=True)
-
-# -----------------------------------------------------------------------------
-# Data Loader (np.memmap)
-# -----------------------------------------------------------------------------
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 def get_batch(split):
     data = train_data if split == 'train' else val_data
@@ -60,7 +68,7 @@ def get_batch(split):
     return x.to(device), y.to(device)
 
 # -----------------------------------------------------------------------------
-# Init Model & Parameter Grouping (Selective Weight Decay)
+# Init Model & Optimizer
 # -----------------------------------------------------------------------------
 model = nanoSubQ(config).to(device)
 
@@ -86,6 +94,8 @@ def configure_optimizer(model, weight_decay, learning_rate):
     return optimizer
 
 optimizer = configure_optimizer(model, weight_decay, learning_rate)
+
+# Synchronized Temperature Scheduler with exact max_iters
 temp_scheduler = TemperatureScheduler(model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
 
 # Cosine Learning Rate Schedule with Warmup
@@ -123,7 +133,7 @@ for iter_num in range(1, max_iters + 1):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        print(f"step {iter_num:4d} | loss {loss.item():.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
+        print(f"step {iter_num:5d}/{max_iters} | loss {loss.item():.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
@@ -134,10 +144,10 @@ for iter_num in range(1, max_iters + 1):
                 _, v_loss, _ = model(x_v, targets=y_v)
                 val_losses.append(v_loss.item())
             mean_val_loss = sum(val_losses) / len(val_losses)
-            print(f"\n--- EVAL @ Step {iter_num} | Validation Loss: {mean_val_loss:.4f} ---\n")
+            print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")
             
             ckpt_path = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
             torch.save(model.state_dict(), ckpt_path)
         model.train()
 
-print("Training finished successfully.")
+print("Full dataset training completed successfully.")
