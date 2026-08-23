@@ -8,39 +8,35 @@ import torch.nn as nn
 from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
 
 # -----------------------------------------------------------------------------
-# Config & Memory Hyperparameters
+# Config & Session Hyperparameters
 # -----------------------------------------------------------------------------
 data_dir = 'data'
 out_dir = 'out'
 
-# Reduced physical batch size to save VRAM, with accumulation to maintain gradient quality
-micro_batch_size = 16   # Dropped from 32 -> 16 to fit safely in GPU VRAM
-gradient_accumulation_steps = 2 # Effective batch size = 16 * 2 = 32
+micro_batch_size = 16   
+gradient_accumulation_steps = 2 # Effective batch size = 32 (16,384 tokens / iter)
 block_size = 512     
-
-tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps # 16,384 tokens / iter
+tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 
 # Load binary dataset mappings
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# Calculate exact iterations required for 1 full epoch
-tokens_in_train = len(train_data)
-max_iters = tokens_in_train // tokens_per_iter
+# Target sprint length: ~2,500 steps is optimal for a solid high-speed training run (~1 hour)
+max_iters = 10000
 
-print(f"Total tokens in train.bin: {tokens_in_train:,}")
-print(f"Effective batch size in tokens: {tokens_per_iter:,}")
-print(f"Calculated iterations for 1 full epoch: {max_iters:,} steps")
+print(f"Total tokens available in train.bin: {len(train_data):,}")
+print(f"Target training run length: {max_iters:,} steps (~{max_iters * tokens_per_iter:,} tokens)")
 
-eval_interval = max(200, max_iters // 20)  # Log ~20 validation checkpoints across run
+eval_interval = 500  # Evaluate and save checkpoint every 500 steps
 log_interval = 20
 eval_iters = 50
 
-# Learning Rate & Optimizer Config
-learning_rate = 6e-4 
-min_lr = 6e-5        
+# Learning Rate & Optimizer Config (Scaled for a fast convergence sprint)
+learning_rate = 1e-3 
+min_lr = 1e-4        
 weight_decay = 0.1
-warmup_iters = min(2000, int(max_iters * 0.05))
+warmup_iters = 100   # Quick warmup so the model picks up speed immediately
 max_grad_norm = 1.0  
 
 # Temperature Schedule Config (Exponential Decay: 2.0 -> 0.1)
@@ -100,11 +96,8 @@ def configure_optimizer(model, weight_decay, learning_rate):
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
 
 optimizer = configure_optimizer(model, weight_decay, learning_rate)
-
-# Temperature Scheduler synchronized across full max_iters
 temp_scheduler = TemperatureScheduler(model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
 
-# Cosine Learning Rate Schedule
 def get_lr(it):
     if it < warmup_iters:
         return learning_rate * (it + 1) / warmup_iters
@@ -130,13 +123,12 @@ for iter_num in range(1, max_iters + 1):
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
 
-    # Gradient Accumulation Loop
     for micro_step in range(gradient_accumulation_steps):
         x, y = get_batch('train')
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
             logits, loss, entropy = model(x, targets=y)
-            loss = loss / gradient_accumulation_steps  # Scale loss for accumulation
+            loss = loss / gradient_accumulation_steps  
 
         accum_loss += loss.item() * gradient_accumulation_steps
         
@@ -145,7 +137,6 @@ for iter_num in range(1, max_iters + 1):
         else:
             loss.backward()
 
-    # Step Optimizer
     if ptdtype == torch.float16:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -159,7 +150,7 @@ for iter_num in range(1, max_iters + 1):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        print(f"step {iter_num:6d}/{max_iters} | loss {accum_loss:.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
+        print(f"step {iter_num:4d}/{max_iters} | loss {accum_loss:.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
@@ -176,9 +167,8 @@ for iter_num in range(1, max_iters + 1):
             ckpt_path = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
             torch.save(model.state_dict(), ckpt_path)
             
-        # Clean up VRAM after eval
         torch.cuda.empty_cache()
         gc.collect()
         model.train()
 
-print("Full dataset training completed successfully.")
+print("Training sprint completed successfully!")
