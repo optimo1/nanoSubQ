@@ -19,7 +19,7 @@ always_save_checkpoint = True
 init_from = 'scratch'
 
 # Data
-dataset = 'nanoSubQ'
+dataset = ''  # Set to empty to resolve paths directly under the data/ directory
 gradient_accumulation_steps = 8
 batch_size = 4
 block_size = 1024
@@ -73,13 +73,22 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# Data Loader
-data_dir = os.path.join('data', dataset)
+# Dynamic Data Loader
+data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
 def get_batch(split):
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        filepath = os.path.join(data_dir, 'train.bin')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        filepath = os.path.join(data_dir, 'val.bin')
+        # Check for val.in/cal.in naming fallbacks if val.bin doesn't exist
+        if not os.path.exists(filepath):
+            if os.path.exists(os.path.join(data_dir, 'val.in')):
+                filepath = os.path.join(data_dir, 'val.in')
+            elif os.path.exists(os.path.join(data_dir, 'cal.in')):
+                filepath = os.path.join(data_dir, 'cal.in')
+
+    data = np.memmap(filepath, dtype=np.uint16, mode='r')
     
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
