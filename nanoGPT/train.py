@@ -28,7 +28,7 @@ max_iters = 10000
 print(f"Total tokens available in train.bin: {len(train_data):,}")
 print(f"Target training run length: {max_iters:,} steps (~{max_iters * tokens_per_iter:,} tokens)")
 
-eval_interval = 500  # Evaluate and save checkpoint every 500 steps
+eval_interval = 1000  # Evaluate and save checkpoint every 500 steps
 log_interval = 20
 eval_iters = 50
 
