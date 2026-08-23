@@ -6,15 +6,16 @@ import torch.nn.functional as F
 
 
 class TemperatureScheduler:
-    def __init__(self, model: nn.Module, t_max: float = 2.0, t_min: float = 0.1, total_steps: int = 1000):
+    def __init__(self, model: nn.Module, t_max: float = 2.0, t_min: float = 0.1, total_steps: int = 1000, decay_rate: float = 3.0):
         self.model = model
         self.t_max = t_max
         self.t_min = t_min
         self.total_steps = total_steps
-        self.decay_rate = -math.log(t_min / t_max) / total_steps
+        self.decay_rate = decay_rate
 
     def step(self, current_step: int) -> float:
-        new_t = self.t_min if current_step >= self.total_steps else self.t_max * math.exp(-self.decay_rate * current_step)
+        progress = current_step / max(1, self.total_steps)
+        new_t = self.t_min + (self.t_max - self.t_min) * math.exp(-self.decay_rate * progress)
         for module in self.model.modules():
             if isinstance(module, PerKVHeadRouter):
                 module.set_temperature(new_t)
@@ -33,11 +34,13 @@ def apply_rotary_emb_indexed(
     sin_cached: torch.Tensor, 
     indices: torch.Tensor
 ) -> torch.Tensor:
+    # cos_cached, sin_cached: [1, 1, max_seq_len, head_dim // 2]
     cos_table = cos_cached.squeeze(0).squeeze(0)  # [max_seq_len, head_dim // 2]
     sin_table = sin_cached.squeeze(0).squeeze(0)  # [max_seq_len, head_dim // 2]
 
-    cos = cos_table[indices]  # [B, H, K_len, head_dim // 2]
-    sin = sin_table[indices]  # [B, H, K_len, head_dim // 2]
+    # Gather indices correctly for shape [B, H, K_len, head_dim // 2]
+    cos = cos_table[indices]  
+    sin = sin_table[indices]  
 
     D_head = x.size(-1)
     x_left = x[..., : D_head // 2]
@@ -65,7 +68,7 @@ class PerKVHeadRouter(nn.Module):
         head_dim: int,
         num_kv_heads: int,
         rank: int = 4,
-        retention_ratio: float = 0.40,  # Retain 40% (prune 60%)
+        retention_ratio: float = 0.40,
         min_k: int = 16,
         block_size: int = 4,
         init_temperature: float = 2.0,
@@ -152,7 +155,7 @@ class PerKVHeadRouter(nn.Module):
         selected_scores = torch.gather(combined_scores, dim=-1, index=sort_perm)
 
         k_total = selected_indices.size(-1)
-        f = torch.tensor(k_total / S, device=k_states.device, dtype=k_states.dtype)
+        f = (k_total / S)  # Optimized graph tensor scalar
         aux_loss = self.alpha * (f * P)
 
         selected_weights = self.ste(selected_scores)
@@ -161,7 +164,6 @@ class PerKVHeadRouter(nn.Module):
 
 
 class SparseKVCache(nn.Module):
-    """Pre-allocated static KV-cache buffer with sparse index routing support."""
     def __init__(self, batch_size: int, num_kv_heads: int, max_seq_len: int, head_dim: int, device: torch.device, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.batch_size = batch_size
@@ -169,17 +171,12 @@ class SparseKVCache(nn.Module):
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         
-        # Static buffer pre-allocation
         shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
         self.register_buffer("k_cache", torch.zeros(shape, dtype=dtype, device=device), persistent=False)
         self.register_buffer("v_cache", torch.zeros(shape, dtype=dtype, device=device), persistent=False)
         self.seq_pos = 0
 
     def update(self, k_val: torch.Tensor, v_val: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        k_val, v_val: [B, H_kv, T_new, D_head]
-        Appends new K/V projections into the pre-allocated cache tensor.
-        """
         bsz, num_heads, t_new, head_dim = k_val.shape
         end_pos = self.seq_pos + t_new
         
@@ -192,7 +189,6 @@ class SparseKVCache(nn.Module):
         return k_active, v_active
 
     def reset(self):
-        """Clears sequence offset and resets cache buffers for next generation pass."""
         self.seq_pos = 0
         self.k_cache.zero_()
         self.v_cache.zero_()
@@ -290,7 +286,6 @@ class SubQAttention(nn.Module):
         k_sparse = torch.gather(k_full, dim=2, index=kv_gather_idx)
         v_sparse = torch.gather(v_full, dim=2, index=kv_gather_idx)
 
-        # Handle Query position indexing for single decoding step vs. prompt evaluation
         if kv_cache is not None and S == 1:
             curr_pos = kv_cache.seq_pos - 1
             q_indices = torch.full((B, self.num_q_heads, 1), curr_pos, device=x.device, dtype=torch.long)
@@ -482,10 +477,6 @@ class nanoSubQ(nn.Module):
         return idx
 
 
-# =============================================================================
-# INTEGRATION & VERIFICATION TEST SUITE
-# =============================================================================
-
 def run_tests():
     print("Running verification tests...")
 
@@ -500,7 +491,6 @@ def run_tests():
     )
     model = nanoSubQ(config)
 
-    # Test 1: Straight-Through Estimator Gradient Flow
     ste = StraightThroughEstimator(threshold=0.5)
     soft_inputs = torch.tensor([0.2, 0.7, 0.4, 0.9], requires_grad=True)
     hard_outputs = ste(soft_inputs)
@@ -510,7 +500,6 @@ def run_tests():
     assert soft_inputs.grad is not None and torch.equal(soft_inputs.grad, torch.ones_like(soft_inputs)), "STE gradient backprop failed"
     print("Test 1 Passed: Straight-Through Estimator forward & backward gradient flow verified.")
 
-    # Test 2: PerKVHeadRouter Selection & Dimensions
     head_dim = config.d_model // config.num_q_heads
     router = PerKVHeadRouter(head_dim=head_dim, num_kv_heads=config.num_kv_heads)
     mock_k = torch.randn(2, config.num_kv_heads, 32, head_dim)
@@ -520,7 +509,6 @@ def run_tests():
     assert aux_loss.item() >= 0.0, "Auxiliary loss should be non-negative"
     print("Test 2 Passed: PerKVHeadRouter dimensions and metrics verified.")
 
-    # Test 3: Forward Pass & Target Loss Computation
     batch_size, seq_len = 2, 16
     dummy_input = torch.randint(0, config.vocab_size, (batch_size, seq_len))
     dummy_targets = torch.randint(0, config.vocab_size, (batch_size, seq_len))
@@ -530,7 +518,6 @@ def run_tests():
     assert loss is not None and loss.item() > 0, "Loss computation failed"
     print("Test 3 Passed: Full model forward pass & target loss verified.")
 
-    # Test 4: Backward Pass across full nanoSubQ model
     model.zero_grad()
     loss.backward()
     for name, param in model.named_parameters():
@@ -538,19 +525,16 @@ def run_tests():
             assert param.grad is not None, f"Parameter {name} did not receive gradients"
     print("Test 4 Passed: Full backward pass succeeded across all parameters.")
 
-    # Test 5: Inference Generation Loop
     prompt = torch.randint(0, config.vocab_size, (1, 8))
     generated = model.generate(prompt, max_new_tokens=5, temperature=1.0, top_k=10, use_cache=False)
     assert generated.shape == (1, 13), f"Expected output shape (1, 13), got {generated.shape}"
     print("Test 5 Passed: Autoregressive token generation verified.")
 
-    # Test 6: Temperature Scheduler Step
     scheduler = TemperatureScheduler(model, t_max=2.0, t_min=0.1, total_steps=100)
     new_t = scheduler.step(current_step=50)
     assert new_t < 2.0 and new_t > 0.1, "Temperature annealing step failed"
     print("Test 6 Passed: TemperatureScheduler functioning properly.")
 
-    # Test 7: Verify KV Token Pruning Ratio
     seq_len = 128
     window_size = 8
     router_test = PerKVHeadRouter(head_dim=16, num_kv_heads=2, retention_ratio=0.40)
@@ -561,7 +545,6 @@ def run_tests():
     assert 50.0 <= pruning_ratio <= 70.0, f"Pruning ratio {pruning_ratio:.2f}% outside expected target range!"
     print(f"Test 7 Passed: Retained {retained_tokens}/{seq_len} tokens. Pruning Ratio = {pruning_ratio:.2f}%")
 
-    # Test 8: Pre-allocated SparseKVCache Generation Match
     prompt_cache = torch.randint(0, config.vocab_size, (1, 8))
     
     g_cached = torch.Generator(device=prompt_cache.device).manual_seed(42)

@@ -4,7 +4,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from model import nanoSubQ, nanoSubQConfig
+from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
 
 # -----------------------------------------------------------------------------
 # Config & Hyperparameters
@@ -59,28 +59,6 @@ def get_batch(split):
     return x.to(device), y.to(device)
 
 # -----------------------------------------------------------------------------
-# Exponential Temperature Scheduler
-# -----------------------------------------------------------------------------
-class TemperatureScheduler:
-    def __init__(self, model: nn.Module, t_max: float = 2.0, t_min: float = 0.1, total_steps: int = 1000, decay_rate: float = 3.0):
-        self.model = model
-        self.t_max = t_max
-        self.t_min = t_min
-        self.total_steps = total_steps
-        self.decay_rate = decay_rate
-
-    def step(self, current_step: int) -> float:
-        progress = current_step / max(1, self.total_steps)
-        # Exponential temperature decay formula
-        temp = self.t_min + (self.t_max - self.t_min) * math.exp(-self.decay_rate * progress)
-        
-        # Apply updated temperature across all router modules in nanoSubQ
-        for module in self.model.modules():
-            if hasattr(module, 'set_temperature'):
-                module.set_temperature(temp)
-        return temp
-
-# -----------------------------------------------------------------------------
 # Init Model & Parameter Grouping (Selective Weight Decay)
 # -----------------------------------------------------------------------------
 model = nanoSubQ(config).to(device)
@@ -93,7 +71,6 @@ def configure_optimizer(model, weight_decay, learning_rate):
         if not param.requires_grad:
             continue
             
-        # Exclude 1D tensors (biases, LayerNorm) and router control/temperature/clamp parameters
         if param.ndim < 2 or "router" in name or "temperature" in name or "clamp" in name:
             no_decay_params.append(param)
         else:
@@ -128,30 +105,25 @@ model.train()
 t0 = time.time()
 
 for iter_num in range(1, max_iters + 1):
-    # 1. Step Learning Rate (Cosine Decay) & Temperature (Exponential Decay)
     lr = get_lr(iter_num)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     temp = temp_scheduler.step(iter_num)
 
-    # 2. Forward Pass
     x, y = get_batch('train')
     logits, loss, entropy = model(x, targets=y)
     
-    # 3. Backward Pass & Safety Guardrail: Gradient Clipping (0.5)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
     optimizer.step()
     
-    # 4. Logging & Binary Entropy Tracking
     if iter_num % log_interval == 0:
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
         print(f"step {iter_num:4d} | loss {loss.item():.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
-    # 5. Evaluation Loop & Checkpointing
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
         with torch.no_grad():
