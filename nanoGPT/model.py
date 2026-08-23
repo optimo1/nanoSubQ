@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TemperatureScheduler:
+class SubQTemperatureScheduler:
     def __init__(self, model: nn.Module, t_max: float = 2.0, t_min: float = 0.1, total_steps: int = 1000):
         self.model = model
         self.t_max = t_max
@@ -16,7 +16,7 @@ class TemperatureScheduler:
     def step(self, current_step: int) -> float:
         new_t = self.t_min if current_step >= self.total_steps else self.t_max * math.exp(-self.decay_rate * current_step)
         for module in self.model.modules():
-            if isinstance(module, PerKVHeadRouter):
+            if isinstance(module, SubQRouter):
                 module.set_temperature(new_t)
         return new_t
 
@@ -59,7 +59,7 @@ class StraightThroughEstimator(nn.Module):
         return soft_scores + (hard_weights - soft_scores).detach()
 
 
-class PerKVHeadRouter(nn.Module):
+class SubQRouter(nn.Module):
     def __init__(
         self,
         head_dim: int,
@@ -160,8 +160,8 @@ class PerKVHeadRouter(nn.Module):
         return selected_indices, selected_weights, aux_loss, routing_entropy
 
 
-class SparseKVCache(nn.Module):
-    """Pre-allocated static KV-cache buffer with sparse index routing support."""
+class SubQKVCache(nn.Module):
+    """Pre-allocated static KV-cache buffer with sparse index routing support for nanoSubQ."""
     def __init__(self, batch_size: int, num_kv_heads: int, max_seq_len: int, head_dim: int, device: torch.device, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.batch_size = batch_size
@@ -176,10 +176,6 @@ class SparseKVCache(nn.Module):
         self.seq_pos = 0
 
     def update(self, k_val: torch.Tensor, v_val: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        k_val, v_val: [B, H_kv, T_new, D_head]
-        Appends new K/V projections into the pre-allocated cache tensor.
-        """
         bsz, num_heads, t_new, head_dim = k_val.shape
         end_pos = self.seq_pos + t_new
         
@@ -192,13 +188,12 @@ class SparseKVCache(nn.Module):
         return k_active, v_active
 
     def reset(self):
-        """Clears sequence offset and resets cache buffers for next generation pass."""
         self.seq_pos = 0
         self.k_cache.zero_()
         self.v_cache.zero_()
 
 
-class MLP(nn.Module):
+class SubQMLP(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
         self.c_fc = nn.Linear(d_model, 4 * d_model)
@@ -213,7 +208,7 @@ class MLP(nn.Module):
         return self.dropout(x)
 
 
-class BatchedSparseAttentionBlock(nn.Module):
+class SubQAttentionBlock(nn.Module):
     def __init__(
         self, d_model: int, num_q_heads: int, num_kv_heads: int, window_size: int = 8, dropout: float = 0.0
     ):
@@ -231,7 +226,7 @@ class BatchedSparseAttentionBlock(nn.Module):
 
         self.num_q_per_kv = num_q_heads // num_kv_heads
 
-        self.router = PerKVHeadRouter(
+        self.router = SubQRouter(
             head_dim=self.head_dim,
             num_kv_heads=num_kv_heads,
             retention_ratio=0.40,
@@ -247,12 +242,12 @@ class BatchedSparseAttentionBlock(nn.Module):
         self.v_proj = nn.Linear(d_model, num_kv_heads * self.head_dim)
         self.out_proj = nn.Linear(d_model, d_model)
 
-        self.mlp = MLP(d_model, dropout=dropout)
+        self.mlp = SubQMLP(d_model, dropout=dropout)
         self.ln_1 = nn.LayerNorm(d_model)
         self.ln_2 = nn.LayerNorm(d_model)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, kv_cache: SparseKVCache = None
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, kv_cache: SubQKVCache = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x_norm = self.ln_1(x)
         B, S, D = x_norm.size()
@@ -290,7 +285,6 @@ class BatchedSparseAttentionBlock(nn.Module):
         k_sparse = torch.gather(k_full, dim=2, index=kv_gather_idx)
         v_sparse = torch.gather(v_full, dim=2, index=kv_gather_idx)
 
-        # Handle Query position indexing for single decoding step vs. prompt evaluation
         if kv_cache is not None and S == 1:
             curr_pos = kv_cache.seq_pos - 1
             q_indices = torch.full((B, self.num_q_heads, 1), curr_pos, device=x.device, dtype=torch.long)
@@ -368,7 +362,7 @@ class nanoSubQ(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.d_model),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([
-                BatchedSparseAttentionBlock(
+                SubQAttentionBlock(
                     d_model=config.d_model,
                     num_q_heads=config.num_q_heads,
                     num_kv_heads=config.num_kv_heads,
@@ -410,7 +404,7 @@ class nanoSubQ(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, kv_caches: list[SparseKVCache] = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, kv_caches: list[SubQKVCache] = None):
         device = idx.device
         b, t = idx.size()
 
@@ -444,7 +438,7 @@ class nanoSubQ(nn.Module):
         if use_cache:
             batch_size = idx.size(0)
             kv_caches = [
-                SparseKVCache(
+                SubQKVCache(
                     batch_size=batch_size,
                     num_kv_heads=self.config.num_kv_heads,
                     max_seq_len=self.config.max_seq_len,
@@ -487,7 +481,7 @@ class nanoSubQ(nn.Module):
 # =============================================================================
 
 def run_tests():
-    print("Running verification tests...")
+    print("Running nanoSubQ verification tests...")
 
     config = nanoSubQConfig(
         vocab_size=1000,
@@ -510,15 +504,15 @@ def run_tests():
     assert soft_inputs.grad is not None and torch.equal(soft_inputs.grad, torch.ones_like(soft_inputs)), "STE gradient backprop failed"
     print("Test 1 Passed: Straight-Through Estimator forward & backward gradient flow verified.")
 
-    # Test 2: PerKVHeadRouter Selection & Dimensions
+    # Test 2: SubQRouter Selection & Dimensions
     head_dim = config.d_model // config.num_q_heads
-    router = PerKVHeadRouter(head_dim=head_dim, num_kv_heads=config.num_kv_heads)
+    router = SubQRouter(head_dim=head_dim, num_kv_heads=config.num_kv_heads)
     mock_k = torch.randn(2, config.num_kv_heads, 32, head_dim)
     indices, weights, aux_loss, entropy = router(mock_k, window_size=8)
     assert indices.shape[0] == 2 and indices.shape[1] == config.num_kv_heads, "Router index dimensions incorrect"
     assert weights.shape == indices.shape, "Router weights shape mismatch"
     assert aux_loss.item() >= 0.0, "Auxiliary loss should be non-negative"
-    print("Test 2 Passed: PerKVHeadRouter dimensions and metrics verified.")
+    print("Test 2 Passed: SubQRouter dimensions and metrics verified.")
 
     # Test 3: Forward Pass & Target Loss Computation
     batch_size, seq_len = 2, 16
@@ -544,16 +538,16 @@ def run_tests():
     assert generated.shape == (1, 13), f"Expected output shape (1, 13), got {generated.shape}"
     print("Test 5 Passed: Autoregressive token generation verified.")
 
-    # Test 6: Temperature Scheduler Step
-    scheduler = TemperatureScheduler(model, t_max=2.0, t_min=0.1, total_steps=100)
+    # Test 6: SubQ Temperature Scheduler Step
+    scheduler = SubQTemperatureScheduler(model, t_max=2.0, t_min=0.1, total_steps=100)
     new_t = scheduler.step(current_step=50)
     assert new_t < 2.0 and new_t > 0.1, "Temperature annealing step failed"
-    print("Test 6 Passed: TemperatureScheduler functioning properly.")
+    print("Test 6 Passed: SubQTemperatureScheduler functioning properly.")
 
     # Test 7: Verify KV Token Pruning Ratio
     seq_len = 128
     window_size = 8
-    router_test = PerKVHeadRouter(head_dim=16, num_kv_heads=2, retention_ratio=0.40)
+    router_test = SubQRouter(head_dim=16, num_kv_heads=2, retention_ratio=0.40)
     test_k = torch.randn(1, 2, seq_len, 16)
     indices, _, _, _ = router_test(test_k, window_size=window_size)
     retained_tokens = indices.size(-1)
@@ -561,7 +555,7 @@ def run_tests():
     assert 50.0 <= pruning_ratio <= 70.0, f"Pruning ratio {pruning_ratio:.2f}% outside expected target range!"
     print(f"Test 7 Passed: Retained {retained_tokens}/{seq_len} tokens. Pruning Ratio = {pruning_ratio:.2f}%")
 
-    # Test 8: Pre-allocated SparseKVCache Generation Match
+    # Test 8: Pre-allocated SubQKVCache Generation Match
     prompt_cache = torch.randint(0, config.vocab_size, (1, 8))
     
     g_cached = torch.Generator(device=prompt_cache.device).manual_seed(42)
@@ -571,7 +565,7 @@ def run_tests():
     gen_uncached = model.generate(prompt_cache.clone(), max_new_tokens=4, temperature=0.1, use_cache=False, generator=g_uncached)
     
     assert torch.equal(gen_cached, gen_uncached), "Cached and uncached generation outputs do not match!"
-    print("Test 8 Passed: Pre-allocated SparseKVCache generation matches standard decoding.")
+    print("Test 8 Passed: Pre-allocated SubQKVCache generation matches standard decoding.")
 
     print("\nAll integration tests completed successfully!")
 

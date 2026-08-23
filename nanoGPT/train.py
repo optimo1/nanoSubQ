@@ -1,6 +1,6 @@
 """
 This training script supports single GPU and DDP training for nanoSubQ using
-the SmolTalk ChatML dataset with Supervised Loss Masking (ignore_index = -100).
+the SmolTalk ChatML dataset with Supervised Loss Masking (ignore_index = -100).[cite: 3]
 
 To run on a single GPU:
 $ python train.py --batch_size=32 --compile=False
@@ -20,7 +20,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import nanoSubQConfig, nanoSubQ
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -35,7 +35,7 @@ init_from = 'scratch' # 'scratch' or 'resume'
 # wandb logging
 wandb_log = False 
 wandb_project = 'smoltalk-nanosubq'
-wandb_run_name = 'sparse-gpt'
+wandb_run_name = 'nanosubq-sparse-routing'
 
 # Data config
 dataset = 'smoltalk'
@@ -44,11 +44,11 @@ batch_size = 8
 block_size = 1024
 
 # Model config
-n_layer = 12
-n_head = 12
-n_embd = 768
+num_layers = 12
+num_q_heads = 12
+num_kv_heads = 4
+d_model = 768
 dropout = 0.0 
-bias = False 
 
 # Optimizer settings
 learning_rate = 6e-4 
@@ -131,12 +131,11 @@ def get_batch(split):
         in_assistant_response = False
         
         for t in range(len(tokens)):
-            # Turn on loss computation after encountering <|im_start|>assistant
             if tokens[t] == IM_START:
                 in_assistant_response = True
             elif tokens[t] == IM_END:
                 if in_assistant_response:
-                    targets[b, t] = y[b, t] # Keep the <|im_end|> token target
+                    targets[b, t] = y[b, t]
                 in_assistant_response = False
             
             if in_assistant_response:
@@ -153,22 +152,29 @@ iter_num = 0
 best_val_loss = 1e9
 
 # Model setup
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=50259, dropout=dropout) 
+model_args = dict(
+    num_layers=num_layers,
+    num_q_heads=num_q_heads,
+    num_kv_heads=num_kv_heads,
+    d_model=d_model,
+    max_seq_len=block_size,
+    vocab_size=50259,
+    dropout=dropout
+) 
 
 if init_from == 'scratch':
     print("Initializing a new nanoSubQ model from scratch...")
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    subq_conf = nanoSubQConfig(**model_args)
+    model = nanoSubQ(subq_conf)
 elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
+    print(f"Resuming nanoSubQ training from {out_dir}")
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['num_layers', 'num_q_heads', 'num_kv_heads', 'd_model', 'max_seq_len', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    subq_conf = nanoSubQConfig(**model_args)
+    model = nanoSubQ(subq_conf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
@@ -180,17 +186,16 @@ elif init_from == 'resume':
 
 model.to(device)
 
-# GradScaler setup
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# Optimizer setup
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# Configure AdamW optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None 
 
 if compile:
-    print("Compiling the model...")
+    print("Compiling the nanoSubQ model...")
     model = torch.compile(model) 
 
 if ddp:
@@ -205,7 +210,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, _ = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -229,7 +234,6 @@ X, Y = get_batch('train')
 t0 = time.time()
 local_iter_num = 0 
 raw_model = model.module if ddp else model 
-running_mfu = -1.0
 
 while True:
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -257,7 +261,7 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"Saving checkpoint to {out_dir}")
+                print(f"Saving nanoSubQ checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     
     if iter_num == 0 and eval_only:
@@ -267,7 +271,7 @@ while True:
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, _ = model(X, Y)
             loss = loss / gradient_accumulation_steps 
         X, Y = get_batch('train')
         scaler.scale(loss).backward()
