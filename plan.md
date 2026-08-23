@@ -101,14 +101,14 @@
 ---
 
 ## 3. STE Training Dynamics & Stabilization (`train.py`)
-- [ ] **Disable Router Biases:** Set `bias=False` on router linear projections to prevent baseline logit shifts from unbalancing STE selection.
-- [ ] **Hyperparameter Configuration:**
+- [done] **Disable Router Biases:** Set `bias=False` on router linear projections to prevent baseline logit shifts from unbalancing STE selection.
+- [done] **Hyperparameter Configuration:**
   - Set learning rate to `3e-4` with a cosine decay schedule.
   - Set AdamW weight decay to `0.1` (applying `0.0` decay to router logit clamps and temperature params).
-- [ ] **Enforce Safety Guardrails:**
+- [done] **Enforce Safety Guardrails:**
   - Apply **Logit Clamping** (`clamp_val=4.0`) inside the router to prevent Sigmoid derivative vanishing.
   - Enable **Gradient Clipping** (`torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)`) to block gradient explosions during STE temperature decay.
-- [ ] **Temperature & Entropy Schedules:** Implement exponential temperature decay ($T = 2.0 \to 0.1$) alongside binary entropy tracking to monitor router convergence from soft exploration to sharp selection.
+- [done] **Temperature & Entropy Schedules:** Implement exponential temperature decay ($T = 2.0 \to 0.1$) alongside binary entropy tracking to monitor router convergence from soft exploration to sharp selection.
 
 ---
 
