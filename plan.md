@@ -95,8 +95,8 @@
   <|im_start|>assistant
   Answer here...<|im_end|>
   ```
-- [ ] **BPE Tokenization (`tiktoken`):** Set up tokenization scripts to encode ChatML-formatted strings into raw integer numpy `.bin` arrays for fast disk-to-GPU loading.
-- [ ] **Supervised Loss Masking:** Modify dataset loading in `train.py` so cross-entropy loss is computed **only on assistant response tokens**, ignoring user prompt tokens (`ignore_index = -100`).
+- [done] **BPE Tokenization (`tiktoken`):** Set up tokenization scripts to encode ChatML-formatted strings into raw integer numpy `.bin` arrays for fast disk-to-GPU loading.
+- [done] **Supervised Loss Masking:** Modify dataset loading in `train.py` so cross-entropy loss is computed **only on assistant response tokens**, ignoring user prompt tokens (`ignore_index = -100`).
 
 ---
 

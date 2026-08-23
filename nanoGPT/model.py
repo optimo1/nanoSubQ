@@ -348,7 +348,7 @@ class BatchedSparseAttentionBlock(nn.Module):
 
 
 @dataclass
-class SparseGPTConfig:
+class nanoSubQConfig:
     vocab_size: int = 50304
     max_seq_len: int = 2048
     d_model: int = 768
@@ -359,8 +359,8 @@ class SparseGPTConfig:
     dropout: float = 0.0
 
 
-class SparseGPT(nn.Module):
-    def __init__(self, config: SparseGPTConfig):
+class nanoSubQ(nn.Module):
+    def __init__(self, config: nanoSubQConfig):
         super().__init__()
         self.config = config
 
@@ -489,7 +489,7 @@ class SparseGPT(nn.Module):
 def run_tests():
     print("Running verification tests...")
 
-    config = SparseGPTConfig(
+    config = nanoSubQConfig(
         vocab_size=1000,
         max_seq_len=128,
         d_model=64,
@@ -498,7 +498,7 @@ def run_tests():
         num_kv_heads=2,
         window_size=8
     )
-    model = SparseGPT(config)
+    model = nanoSubQ(config)
 
     # Test 1: Straight-Through Estimator Gradient Flow
     ste = StraightThroughEstimator(threshold=0.5)
@@ -530,7 +530,7 @@ def run_tests():
     assert loss is not None and loss.item() > 0, "Loss computation failed"
     print("Test 3 Passed: Full model forward pass & target loss verified.")
 
-    # Test 4: Backward Pass across full SparseGPT model
+    # Test 4: Backward Pass across full nanoSubQ model
     model.zero_grad()
     loss.backward()
     for name, param in model.named_parameters():
