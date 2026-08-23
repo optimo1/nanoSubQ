@@ -7,38 +7,39 @@ import torch.nn as nn
 from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
 
 # -----------------------------------------------------------------------------
-# Config & Hyperparameters
+# Config & Hyperparameters (Small Model Run)
 # -----------------------------------------------------------------------------
 data_dir = 'data'
 out_dir = 'out'
-batch_size = 8
-block_size = 128  # max_seq_len
-max_iters = 1000
-eval_interval = 100
-log_interval = 10
-eval_iters = 20
+batch_size = 32      # Increased batch size for better gradient stability
+block_size = 512     # Extended context window length
+max_iters = 5000     # Longer training run for convergence
+eval_interval = 250
+log_interval = 20
+eval_iters = 50
 
 # Learning Rate & Optimizer Config
-learning_rate = 3e-4
-min_lr = 3e-5       # 10% of peak learning rate for cosine decay
+learning_rate = 6e-4 # Slightly higher base LR for smaller architecture scale
+min_lr = 6e-5        # 10% decay minimum
 weight_decay = 0.1
-warmup_iters = 100
-max_grad_norm = 0.5 # Safety Guardrail: Block STE temperature decay gradient explosions
+warmup_iters = 250   # Scaled warmup steps
+max_grad_norm = 1.0  # Stable gradient clipping threshold
 
 # Temperature Schedule Config (Exponential Decay: 2.0 -> 0.1)
 t_max = 2.0
 t_min = 0.1
 t_decay_rate = 3.0
 
-# Model Config
+# Model Config (~15M Parameters)
 config = nanoSubQConfig(
     vocab_size=50304,
     max_seq_len=block_size,
-    d_model=128,
-    num_layers=4,
-    num_q_heads=4,
-    num_kv_heads=2,
+    d_model=384,        # 384 / 6 heads = 64 head_dim
+    num_layers=6,       # 6 Transformer blocks
+    num_q_heads=6,      # Divisible by num_kv_heads (6 / 2 = 3)
+    num_kv_heads=2,      # Grouped Query Attention ratio
     window_size=8,
+    dropout=0.0,
 )
 
 device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
