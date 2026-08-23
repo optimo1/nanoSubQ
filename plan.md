@@ -87,8 +87,8 @@
 ---
 
 ## 2. Dataset Pipeline & Chat Tuning
-- [ ] **Dataset Curation:** Select a compact, high-quality instruction dataset (e.g., SmolTalk, UltraChat 200k, or a subset of OpenHermes) to teach conversational behavior.
-- [ ] **Implement ChatML Templates:** Format text data into structured conversation tokens using standard delimiters:
+- [done] **Dataset Curation:** Select a compact, high-quality instruction dataset (e.g., SmolTalk, UltraChat 200k, or a subset of OpenHermes) to teach conversational behavior.
+- [done] **Implement ChatML Templates:** Format text data into structured conversation tokens using standard delimiters:
   ```text
   <|im_start|>user
   Question here...<|im_end|>
