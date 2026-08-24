@@ -99,6 +99,28 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
 else:
     model = raw_model.to(device)
 
+# Pre-compile the flex kernel (forward AND backward) on every GPU, single-threaded.
+# torch.compile + nn.DataParallel is not thread-safe during the FIRST compile: DP runs the
+# replicas in worker threads while the main thread compiles the backward, and torch's
+# compilation-metrics context is one GLOBAL (not thread-local), so the worker-thread forward
+# compile leaves 'is_forward' set and the first backward compile raises
+# "Metric(s) {'is_forward'} have already been set in the current context".
+# Warming up fwd+bwd per device with the exact per-replica batch makes every training-loop call
+# a compile-cache hit, so no compilation ever happens under DataParallel. (~1-2 min one-time.)
+if torch.cuda.is_available() and torch.cuda.device_count() > 1 and config.attn_impl == 'flex':
+    warm_batch = max(1, micro_batch_size // torch.cuda.device_count())   # what DP gives each replica
+    for gi in range(torch.cuda.device_count()):
+        with torch.cuda.device(gi):
+            w = nanoSubQ(config).to(f'cuda:{gi}')
+            wx = torch.randint(0, config.vocab_size, (warm_batch, block_size), device=f'cuda:{gi}')
+            wy = torch.randint(0, config.vocab_size, (warm_batch, block_size), device=f'cuda:{gi}')
+            with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
+                _, wl, *_ = w(wx, targets=wy)
+            wl.sum().backward()       # also compiles the flex backward graph
+            del w
+        torch.cuda.empty_cache()
+    print(f"pre-compiled flex kernel (fwd+bwd) on {torch.cuda.device_count()} GPUs")
+
 def get_lr(it):
     if it < warmup_iters:
         return learning_rate * (it + 1) / warmup_iters
