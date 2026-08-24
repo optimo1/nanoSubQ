@@ -33,7 +33,6 @@ class TemperatureScheduler:
         self.total_steps = total_steps
 
     def step(self, current_step):
-        # Linear decay across total_steps
         progress = min(1.0, max(0.0, current_step / self.total_steps))
         temp = self.t_max - progress * (self.t_max - self.t_min)
         
@@ -78,11 +77,12 @@ class SubQAttention(nn.Module):
         q_rot = apply_rotary_emb(q, cos[:, :, :S, :], sin[:, :, :S, :])
         k_rot = apply_rotary_emb(k, cos[:, :, :S, :], sin[:, :, :S, :])
 
-        router_logits = self.router(x) / self.temperature
+        # Clamp router logits to prevent gradient explosion
+        router_logits = torch.clamp(self.router(x), -10.0, 10.0) / self.temperature
         router_scores = torch.sigmoid(router_logits).transpose(1, 2)
         ste_weights = StraightThroughEstimator.apply(router_scores)
 
-        # FP32 computation prevents NaN underflow in reduced precision
+        # FP32 computation prevents underflow/overflow in reduced precision
         p_fp32 = router_scores.float()
         p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
         entropy = - (p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
@@ -117,8 +117,6 @@ class SubQAttention(nn.Module):
 
         att_scores = att_scores.masked_fill(causal_mask, float('-inf'))
         att_weights = F.softmax(att_scores, dim=-1)
-        
-        # Convert NaN rows (where all keys were masked out) to 0.0
         att_weights = torch.nan_to_num(att_weights, nan=0.0)
 
         out = torch.matmul(att_weights, v_sparse)

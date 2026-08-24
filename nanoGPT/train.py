@@ -18,18 +18,18 @@ tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# --- Stable Option 2 Config (50,000 Steps) ---
+# --- Hyperparameters Updated for Absolute Stability ---
 max_iters = 50000         
 eval_interval = 2500       
 log_interval = 20         
 eval_iters = 50            
-warmup_iters = 2000        # Extended warmup for stability
+warmup_iters = 1000        
 
-learning_rate = 1.5e-4     # Reduced peak LR to prevent loss divergence
-min_lr = 1.5e-5        
+learning_rate = 6.0e-5     # Reduced peak learning rate to avoid gradient explosion
+min_lr = 6.0e-6        
 weight_decay = 0.1
-max_grad_norm = 0.5        # Stricter gradient clipping for router stability
-entropy_coef = 0.01        # Entropy regularization penalty weight
+max_grad_norm = 0.25       # Tightened gradient clip norm for router stability
+entropy_coef = 0.01        
 
 t_max = 2.0
 t_min = 0.1
@@ -116,7 +116,6 @@ for iter_num in range(1, max_iters + 1):
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
             logits, ce_loss, entropy = model(x, targets=y)
-            # Total Loss = CE Loss - Entropy Regularization
             total_loss = ce_loss.mean() - entropy_coef * entropy.mean()
             loss_scaled = total_loss / gradient_accumulation_steps  
 
