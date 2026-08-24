@@ -17,7 +17,7 @@ print("1. data OK (uint32):", first)
 # 2. tiny model, forward + backward
 torch.manual_seed(0)
 cfg = nanoSubQConfig(vocab_size=50304, max_seq_len=256, d_model=128, num_layers=2,
-                     num_q_heads=4, num_kv_heads=2, block=32, top_c=8, local=1)
+                     num_q_heads=4, num_kv_heads=2, block=128, top_c=4, local=1)
 m = nanoSubQ(cfg).train()
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 idx = torch.randint(0, cfg.vocab_size, (4, 256))

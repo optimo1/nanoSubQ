@@ -30,8 +30,11 @@ class nanoSubQConfig:
     num_layers: int = 6
     num_q_heads: int = 6
     num_kv_heads: int = 2
-    block: int = 32          # routing key-block size (per-query-block selection -> near-linear kernel)
-    top_c: int = 8           # top key-blocks selected per query block (causal)
+    block: int = 128         # routing key-block size. MUST be a multiple of 128: torch's compiled flex
+                             #   kernel (>=2.5) requires the mask block size to be a multiple of its
+                             #   BLOCK_M/BLOCK_N tiles (128/64 for fp16) or it raises
+                             #   "Q and KV block size must be divisible by BLOCK_M and BLOCK_N".
+    top_c: int = 4           # top key-blocks selected per query block (causal)
     local: int = 1           # always keep own block + this many preceding blocks
     beta: float = 2.0        # cumulant temperature (repo measured optimum ~2)
     attn_impl: str = 'flex'  # 'flex' = O(n*kappa) fused kernel; 'masked' = O(n^2) exact reference
@@ -101,6 +104,11 @@ def ssa_flex(q, k, v, sel, block, num_q_per_kv):
     B, NQ, n, d = q.shape
     nb = sel.shape[-1]
     assert n % block == 0
+    if torch.cuda.is_available():
+        # torch's compiled flex kernel requires the mask block size to be a multiple of its
+        # BLOCK_M/BLOCK_N tiles (128/64 for fp16); a 32-block mask fails at compile time with
+        # "Q and KV block size must be divisible by BLOCK_M and BLOCK_N". Fail fast here instead.
+        assert block % 128 == 0, f"flex kernel needs routing block a multiple of 128, got block={block}"
     sel_q = sel.repeat_interleave(num_q_per_kv, dim=1)              # (B,NQ,nb,nb)
     kv_num = sel_q.sum(-1).to(torch.int32)
     kv_idx = torch.argsort(sel_q.int(), dim=-1, descending=True, stable=True).to(torch.int32)

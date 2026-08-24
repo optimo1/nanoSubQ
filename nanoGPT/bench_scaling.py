@@ -17,7 +17,7 @@ from model import nanoSubQConfig, SubQAttention
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", default="512,1024,2048,4096,8192,16384")
-    ap.add_argument("--block", type=int, default=32)
+    ap.add_argument("--block", type=int, default=128)  # must be a multiple of 128 for the CUDA flex kernel
     ap.add_argument("--top_c", type=int, default=8)
     ap.add_argument("--reps", type=int, default=5)
     args = ap.parse_args()

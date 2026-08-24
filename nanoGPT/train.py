@@ -12,14 +12,15 @@ out_dir = 'out'
 
 micro_batch_size = 16
 gradient_accumulation_steps = 2
-block_size = 512
+block_size = 1024
 
 # data/prepare.py writes uint32; read as uint32 (reading as uint16 corrupts every other token to 0)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r')
 
-# ~5h on 2x T4 (fp16): 35000 iters ≈ 5-7h at ~0.5-0.7 s/step. Tune with: iters ≈ 5h/(s per step).
-max_iters = 35000
+# ~5h on 2x T4 (fp16): 16000 iters ≈ 5h at ~1.1 s/step (n=1024 doubles tokens/step vs the old n=512).
+# Tune with: iters ≈ 5h/(s per step).
+max_iters = 16000
 eval_interval = 2500
 log_interval = 20
 eval_iters = 50
@@ -41,8 +42,8 @@ config = nanoSubQConfig(
     num_layers=6,
     num_q_heads=6,
     num_kv_heads=2,
-    block=32,          # routing block size; 512 // 32 = 16 blocks
-    top_c=8,           # ~50% of causally-visible blocks selected + local window
+    block=128,         # routing block size; must be a multiple of 128 for the CUDA flex kernel (1024 // 128 = 8 blocks)
+    top_c=4,           # ~50% of causally-visible blocks selected + local window
     local=1,
     beta=2.0,          # cumulant routing temperature
     attn_impl='flex',  # O(n*kappa) fused kernel; 'masked' = O(n^2) exact reference
