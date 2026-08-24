@@ -21,9 +21,9 @@ max_iters = 50000
 eval_interval = 2500
 log_interval = 20
 eval_iters = 50
-warmup_iters = 2000  # Restored to 2000
+warmup_iters = 2000  
 
-learning_rate = 3.0e-4   # Lower peak LR for stability early on
+learning_rate = 3.0e-4   
 min_lr = 3.0e-5          
 weight_decay = 0.1
 max_grad_norm = 0.5      
@@ -44,8 +44,9 @@ config = nanoSubQConfig(
     num_kv_heads=2,
     window_size=8,
     dropout=0.0,
-    hard_gate=False,        
-    ste_scale=0.5,          
+    # --- CRITICAL UPDATE HERE ---
+    hard_gate=True,         # Enabled Hard Gating to preserve attention magnitude
+    ste_scale=0.5,          # Maintain gradient scaling for the router
     router_lr_mult=0.5,     
     usage_target=0.5,
     gate_warmup_steps=gate_warmup_steps,
