@@ -17,43 +17,24 @@ class nanoSubQConfig:
     dropout: float = 0.0
 
     # --- Router stability controls ---
-    hard_gate: bool = True           # Ensure this remains True for STE
-    ste_scale: float = 0.5           
     router_lr_mult: float = 0.5      
     usage_target: float = 0.5        
-    gate_warmup_steps: int = 2000    
-
-class ScaledSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return (x >= 0.5).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output * ScaledSTE.grad_scale
-
-ScaledSTE.grad_scale = 0.5  
 
 class TemperatureScheduler:
-    def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000,
-                 gate_warmup_steps=2000, **kwargs):
+    def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000, **kwargs):
         self.model = model
         self.t_max = t_max
         self.t_min = t_min
         self.total_steps = total_steps
-        self.gate_warmup_steps = max(1, gate_warmup_steps)
 
     def step(self, current_step):
         progress = min(1.0, max(0.0, current_step / self.total_steps))
         temp = self.t_max - progress * (self.t_max - self.t_min)
 
-        gate_scale = min(1.0, current_step / self.gate_warmup_steps)
-
         target_model = self.model.module if hasattr(self.model, 'module') else self.model
         for block in target_model.layers:
             block.attn.temperature = temp
-            block.attn.gate_scale = gate_scale
-        return temp, gate_scale
+        return temp
 
 def apply_rotary_emb(x, cos, sin):
     d_half = x.shape[-1] // 2
@@ -73,11 +54,9 @@ class SubQAttention(nn.Module):
         self.head_dim = config.d_model // config.num_q_heads
         self.window_size = config.window_size
         self.k_ratio = config.k_ratio
-        self.hard_gate = config.hard_gate
         self.usage_target = config.usage_target
 
         self.temperature = 2.0
-        self.gate_scale = 0.0  
 
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.k_proj = nn.Linear(config.d_model, self.num_kv_heads * self.head_dim, bias=False)
@@ -122,24 +101,16 @@ class SubQAttention(nn.Module):
         k_rot_sparse = torch.gather(k_rot, dim=2, index=gather_idx)
         v_sparse = torch.gather(v, dim=2, index=gather_idx)
 
-        # --- CRITICAL FIX: Gather scores for Keys, apply gate to Values ---
+        # --- THE FIX: Straight-Through Identity Proxy ---
         kv_scores = torch.gather(router_scores, dim=2, index=kv_indices_sorted)
-
-        if self.hard_gate:
-            ste_weights = ScaledSTE.apply(kv_scores)
-            soft_or_hard_gate = ste_weights
-        else:
-            soft_or_hard_gate = kv_scores
-
-        ones = torch.ones_like(soft_or_hard_gate)
-        blended_kv_gate = self.gate_scale * soft_or_hard_gate + (1.0 - self.gate_scale) * ones
+        kv_gate_proxy = kv_scores - kv_scores.detach() + 1.0
 
         k_rot_sparse = k_rot_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
         v_sparse = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
-        blended_kv_gate = blended_kv_gate.repeat_interleave(self.num_q_per_kv, dim=1)
+        kv_gate_proxy = kv_gate_proxy.repeat_interleave(self.num_q_per_kv, dim=1)
 
-        # Gate the Values to pass gradients back to the router without blinding queries
-        v_sparse = v_sparse * blended_kv_gate.unsqueeze(-1)
+        # Forward pass applies exactly 1.0. Backward pass routes gradients perfectly.
+        v_sparse = v_sparse * kv_gate_proxy.unsqueeze(-1)
 
         att_scores = torch.matmul(q_rot, k_rot_sparse.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
@@ -155,12 +126,10 @@ class SubQAttention(nn.Module):
         has_valid_keys = (~causal_mask).any(dim=-1, keepdim=True)
         att_weights = att_weights * has_valid_keys.float()
 
-        # Output is NOT gated here anymore! Queries remain 100% active.
         out = torch.matmul(att_weights, v_sparse)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
 
         return self.out_proj(out), entropy, usage_penalty
-
 
 class Block(nn.Module):
     def __init__(self, config: nanoSubQConfig):
@@ -180,12 +149,10 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x, entropy, usage_penalty
 
-
 class nanoSubQ(nn.Module):
     def __init__(self, config: nanoSubQConfig):
         super().__init__()
         self.config = config
-        ScaledSTE.grad_scale = config.ste_scale
 
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
@@ -224,7 +191,9 @@ class nanoSubQ(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1), 
+                ignore_index=-100
             ).unsqueeze(0)
 
         return logits, loss, avg_entropy, avg_usage_penalty

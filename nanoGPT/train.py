@@ -33,7 +33,6 @@ usage_coef = 0.01
 
 t_max = 2.0
 t_min = 0.1
-gate_warmup_steps = 2000  
 
 config = nanoSubQConfig(
     vocab_size=50304,
@@ -44,11 +43,8 @@ config = nanoSubQConfig(
     num_kv_heads=2,
     window_size=8,
     dropout=0.0,
-    hard_gate=True,         # Fixed: Enforce hard gating to prevent magnitude drop at step 2000
-    ste_scale=0.5,          
     router_lr_mult=0.5,     
     usage_target=0.5,
-    gate_warmup_steps=gate_warmup_steps,
 )
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -58,7 +54,6 @@ scaler = torch.amp.GradScaler('cuda', enabled=(ptdtype == torch.float16))
 print(f"Using device: {device} | Precision: {ptdtype}")
 os.makedirs(out_dir, exist_ok=True)
 
-
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (micro_batch_size,))
@@ -66,9 +61,7 @@ def get_batch(split):
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     return x.to(device), y.to(device)
 
-
 raw_model = nanoSubQ(config)
-
 
 def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
     decay_params = []
@@ -93,11 +86,9 @@ def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
 
     return torch.optim.AdamW(optim_groups, betas=(0.9, 0.95))
 
-
 optimizer = configure_optimizer(raw_model, weight_decay, learning_rate, config.router_lr_mult)
 temp_scheduler = TemperatureScheduler(
-    raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters,
-    gate_warmup_steps=gate_warmup_steps,
+    raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters
 )
 
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -105,7 +96,6 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     model = nn.DataParallel(raw_model).to(device)
 else:
     model = raw_model.to(device)
-
 
 def get_lr(it):
     if it < warmup_iters:
@@ -115,7 +105,6 @@ def get_lr(it):
     decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
-
 
 model.train()
 t0 = time.time()
@@ -127,7 +116,7 @@ for iter_num in range(1, max_iters + 1):
     optimizer.param_groups[1]['lr'] = lr
     optimizer.param_groups[2]['lr'] = lr * config.router_lr_mult
 
-    temp, gate_scale = temp_scheduler.step(iter_num)
+    temp = temp_scheduler.step(iter_num)[0] if isinstance(temp_scheduler.step(iter_num), tuple) else temp_scheduler.step(iter_num)
 
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
@@ -170,7 +159,7 @@ for iter_num in range(1, max_iters + 1):
         avg_entropy = accum_entropy / gradient_accumulation_steps
         avg_usage = accum_usage / gradient_accumulation_steps
         print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | "
-              f"usage_pen {avg_usage:.4f} | lr {lr:.6f} | temp {temp:.2f} | gate {gate_scale:.2f} | "
+              f"usage_pen {avg_usage:.4f} | lr {lr:.6f} | temp {temp:.2f} | "
               f"time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
