@@ -22,18 +22,20 @@ m = nanoSubQ(cfg).train()
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 idx = torch.randint(0, cfg.vocab_size, (4, 256))
 tgt = torch.randint(0, cfg.vocab_size, (4, 256))
-logits, loss, sparsity = m(idx, tgt)
+logits, loss, sparsity, entropy, load = m(idx, tgt)
 assert logits.shape == (4, 256, cfg.vocab_size), logits.shape
 loss.backward()
 g = sum(p.grad.abs().sum().item() for p in m.parameters() if p.grad is not None)
 assert g > 0, "no gradient flowed"
+for v in (sparsity.item(), entropy.item(), load.item()):
+    assert math.isfinite(v), "non-finite diagnostic"
 print(f"2. shapes OK; logits {tuple(logits.shape)}; grad_sum {g:.3f}")
 
 # 3. loss decreases over 40 steps on a fixed batch, never NaN
 first_loss = None
 for step in range(40):
     opt.zero_grad(set_to_none=True)
-    logits, loss, sparsity = m(idx, tgt)
+    logits, loss, sparsity, entropy, load = m(idx, tgt)
     l = loss.item()
     assert math.isfinite(l), f"non-finite loss at step {step}: {l}"
     if step == 0:
