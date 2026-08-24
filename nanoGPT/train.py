@@ -7,47 +7,36 @@ import torch
 import torch.nn as nn
 from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
 
-# -----------------------------------------------------------------------------
-# Config & Session Hyperparameters
-# -----------------------------------------------------------------------------
 data_dir = 'data'
 out_dir = 'out'
 
 micro_batch_size = 16   
-gradient_accumulation_steps = 2 # Effective batch size = 32 per iteration (16,384 tokens)
+gradient_accumulation_steps = 2
 block_size = 512      
 tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 
-# Load binary dataset mappings
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# Target length: 24,000 steps (~10 hours on dual GPU)
-max_iters = 24000
+# --- Quick Dry Run Config ---
+max_iters = 50           # Run for only 50 steps
+eval_interval = 25       # Run validation twice (at step 25 and step 50)
+log_interval = 5         # Print logs every 5 steps
+eval_iters = 5           # Keep validation fast (5 batches instead of 50)        # Scale down LR warmup for the short run
 
-print(f"Total tokens available in train.bin: {len(train_data):,}")
-print(f"Target training run length: {max_iters:,} steps (~{max_iters * tokens_per_iter:,} tokens)")
-
-eval_interval = 2000  # Evaluate and save checkpoint every 2,000 steps (~50 mins)
-log_interval = 20
-eval_iters = 50
-
-# Learning Rate & Optimizer Config (Scaled for 10-hour run)
-learning_rate = 6e-4  
-min_lr = 6e-5        
+learning_rate = 3e-4  
+min_lr = 3e-5        
 weight_decay = 0.1
-warmup_iters = 500    
+warmup_iters = 10  
 max_grad_norm = 1.0  
 
-# Temperature Schedule Config (Exponential Decay: 2.0 -> 0.1)
 t_max = 2.0
 t_min = 0.1
 t_decay_rate = 3.0
 
-# Model Config (~15M Parameters)
 config = nanoSubQConfig(
     vocab_size=50304,
-    max_seq_len=block_size,
+    max_seq_len=1024,  # RoPE precomputes up to 1024 for generation headroom
     d_model=384,        
     num_layers=6,       
     num_q_heads=6,      
@@ -70,9 +59,6 @@ def get_batch(split):
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     return x.to(device), y.to(device)
 
-# -----------------------------------------------------------------------------
-# Init Model, Optimizer, & Multi-GPU Setup
-# -----------------------------------------------------------------------------
 raw_model = nanoSubQ(config)
 
 def configure_optimizer(model, weight_decay, learning_rate):
@@ -82,8 +68,7 @@ def configure_optimizer(model, weight_decay, learning_rate):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-            
-        if param.ndim < 2 or "router" in name or "temperature" in name or "clamp" in name:
+        if param.ndim < 2 or "router" in name or "temperature" in name or "ln" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -96,11 +81,8 @@ def configure_optimizer(model, weight_decay, learning_rate):
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
 
 optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
-
-# Temperature Scheduler targets the underlying model instance
 temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
 
-# Wrap model with DataParallel if multiple GPUs are available
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
     model = nn.DataParallel(raw_model).to(device)
@@ -113,13 +95,9 @@ def get_lr(it):
     if it > max_iters:
         return min_lr
     decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
 
-# -----------------------------------------------------------------------------
-# Training Loop
-# -----------------------------------------------------------------------------
 model.train()
 t0 = time.time()
 
@@ -131,17 +109,18 @@ for iter_num in range(1, max_iters + 1):
 
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
+    accum_entropy = 0.0
 
     for micro_step in range(gradient_accumulation_steps):
         x, y = get_batch('train')
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
             logits, loss, entropy = model(x, targets=y)
-            # Reduce multi-GPU vectors down to scalar means
             loss = loss.mean() / gradient_accumulation_steps  
-            entropy = entropy.mean()
+            entropy_step = entropy.mean() / gradient_accumulation_steps
 
         accum_loss += loss.item() * gradient_accumulation_steps
+        accum_entropy += entropy_step.item() * gradient_accumulation_steps
         
         if ptdtype == torch.float16:
             scaler.scale(loss).backward()
@@ -161,7 +140,9 @@ for iter_num in range(1, max_iters + 1):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        print(f"step {iter_num:5d}/{max_iters} | loss {accum_loss:.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
+        avg_loss = accum_loss / gradient_accumulation_steps
+        avg_entropy = accum_entropy / gradient_accumulation_steps
+        print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
@@ -176,11 +157,10 @@ for iter_num in range(1, max_iters + 1):
             print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")
             
             ckpt_path = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
-            # Save raw model weights without the 'module.' DataParallel prefix
             torch.save(raw_model.state_dict(), ckpt_path)
             
         torch.cuda.empty_cache()
         gc.collect()
         model.train()
 
-print("Training sprint completed successfully!")
+print("Training finished successfully!")
