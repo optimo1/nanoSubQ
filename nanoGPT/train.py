@@ -19,11 +19,18 @@ train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mod
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 # --- Quick Dry Run Config ---
-max_iters = 50           
-eval_interval = 25       
-log_interval = 5         
-eval_iters = 5           
-warmup_iters = 10        
+# max_iters = 50           
+# eval_interval = 25       
+# log_interval = 5         
+# eval_iters = 5           
+# warmup_iters = 10   
+
+# --- Full Training Config ---
+max_iters = 24000         
+eval_interval = 2000       
+log_interval = 20         
+eval_iters = 50           
+warmup_iters = 500     
 
 learning_rate = 3e-4  
 min_lr = 3e-5        
