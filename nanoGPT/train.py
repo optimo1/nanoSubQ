@@ -2,6 +2,9 @@ import os
 import time
 import math
 import gc
+import json
+import shutil
+import subprocess
 import argparse
 import numpy as np
 import torch
@@ -10,11 +13,55 @@ from model import nanoSubQ, nanoSubQConfig
 
 data_dir = 'data'
 out_dir = 'out'
+kaggle_sync_dir = 'kaggle_sync'   # staging dir for the Kaggle Dataset backup
 
 ap = argparse.ArgumentParser(description="Train nanoSubQ (near-linear content-routed attention).")
 ap.add_argument('--resume', type=str, default=None,
                 help="checkpoint .pt, or a dir containing ckpt_step_*.pt, to resume from (continue training)")
+ap.add_argument('--kaggle-dataset', type=str, default=None,
+                help="owner/dataset to durably back up the latest checkpoint to after each eval "
+                     "(auto-creates the dataset on first push; needs KAGGLE_USERNAME/KAGGLE_KEY env "
+                     "from notebook Secrets and the `kaggle` CLI). Resume later with: "
+                     "kaggle datasets download <owner>/<dataset> -p restore && unzip -o restore/*.zip -d restore "
+                     "then: python train.py --resume restore/latest.pt")
 args = ap.parse_args()
+
+
+def push_to_kaggle(ckpt_path, iter_num):
+    """Durably back up the newest checkpoint to a Kaggle Dataset (survives session reaping).
+
+    Only 'latest.pt' is synced so each upload stays a single ~578MB file. Non-fatal: a failed
+    push is logged and training keeps going (the local out/ checkpoint is still the source of
+    truth until you download this one)."""
+    if shutil.which('kaggle') is None:
+        print("  !! kaggle CLI not found -- install it with `pip install kaggle` to enable dataset backup")
+        return
+    os.makedirs(kaggle_sync_dir, exist_ok=True)
+    latest = os.path.join(kaggle_sync_dir, 'latest.pt')
+    if os.path.exists(latest):
+        os.remove(latest)
+    try:
+        os.link(ckpt_path, latest)          # hardlink: instant, no extra disk copy
+    except OSError:
+        shutil.copyfile(ckpt_path, latest)
+    meta = os.path.join(kaggle_sync_dir, 'dataset-metadata.json')
+    if not os.path.exists(meta):
+        with open(meta, 'w') as f:
+            json.dump({'id': None, 'title': args.kaggle_dataset.split('/')[-1], 'isPrivate': True}, f)
+    with open(meta) as f:
+        is_new = json.load(f).get('id') is None
+    cmd = ['kaggle', 'datasets', 'create' if is_new else 'version',
+           '-p', kaggle_sync_dir, '-m', f'step {iter_num}']
+    print(f"  backing up latest checkpoint to Kaggle dataset {args.kaggle_dataset} ...", flush=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        tail = (r.stdout or r.stderr or '').strip()[-400:]
+        if r.returncode == 0:
+            print(f"  kaggle backup OK: {tail}", flush=True)
+        else:
+            print(f"  !! kaggle push reported failure (non-fatal, continuing): {tail}", flush=True)
+    except Exception as e:
+        print(f"  !! kaggle push failed (non-fatal, continuing): {e}", flush=True)
 
 micro_batch_size = 16
 gradient_accumulation_steps = 2
@@ -242,6 +289,8 @@ for iter_num in range(start_iter + 1, max_iters + 1):
                 'config': config,
             }, ckpt_path)
             print(f"  saved {ckpt_path}")
+            if args.kaggle_dataset is not None:
+                push_to_kaggle(ckpt_path, iter_num)
 
         torch.cuda.empty_cache()
         gc.collect()
