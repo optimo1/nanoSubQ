@@ -25,12 +25,12 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r
 # eval_iters = 5           
 # warmup_iters = 10   
 
-# --- Full Training Config ---
-max_iters = 24000         
-eval_interval = 2000       
+# --- Option 2: Full Training Config (50,000 Steps) ---
+max_iters = 50000         
+eval_interval = 2500       
 log_interval = 20         
-eval_iters = 50           
-warmup_iters = 500     
+eval_iters = 50            
+warmup_iters = 1000     
 
 learning_rate = 3e-4  
 min_lr = 3e-5        
