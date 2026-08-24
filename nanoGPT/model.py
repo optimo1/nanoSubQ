@@ -101,10 +101,9 @@ class SubQAttention(nn.Module):
         k_rot_sparse = torch.gather(k_rot, dim=2, index=gather_idx)
         v_sparse = torch.gather(v, dim=2, index=gather_idx)
 
-        # --- THE FIX: Straight-Through Attention Multiplier ---
-        kv_scores = torch.gather(router_scores, dim=2, index=kv_indices_sorted)
+        # 1. Gather the clamped router probabilities for the selected tokens
+        kv_scores = torch.gather(p_clamped, dim=2, index=kv_indices_sorted)
         kv_scores_expanded = kv_scores.repeat_interleave(self.num_q_per_kv, dim=1).unsqueeze(2)
-        kv_gate = kv_scores_expanded - kv_scores_expanded.detach() + 1.0
 
         k_rot_sparse = k_rot_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
         v_sparse = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
@@ -116,15 +115,21 @@ class SubQAttention(nn.Module):
 
         causal_mask = kv_idx_expanded > q_idx
 
+        # 2. Safe masking without NaN gradient propagation
         mask_val = -1e4 if att_scores.dtype in (torch.float16, torch.bfloat16) else -1e9
         att_scores = att_scores.masked_fill(causal_mask, mask_val)
+        
+        # 3. Standard Softmax Attention
         att_weights = F.softmax(att_scores, dim=-1)
+
+        # --- THE ULTIMATE FIX: Re-normalized Differentiable Routing ---
+        # Multiply by router probabilities and Re-Normalize to exactly 1.0.
+        # This gives the router clean, bounded gradients based purely on relative token importance!
+        att_weights = att_weights * kv_scores_expanded
+        att_weights = att_weights / (att_weights.sum(dim=-1, keepdim=True) + 1e-9)
 
         has_valid_keys = (~causal_mask).any(dim=-1, keepdim=True)
         att_weights = att_weights * has_valid_keys.float()
-        
-        # Apply the magic proxy gate directly to the attention weights
-        att_weights = att_weights * kv_gate
 
         out = torch.matmul(att_weights, v_sparse)
         out = out.transpose(1, 2).contiguous().view(B, S, D)

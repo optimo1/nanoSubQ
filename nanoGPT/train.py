@@ -116,10 +116,7 @@ for iter_num in range(1, max_iters + 1):
     optimizer.param_groups[1]['lr'] = lr
     optimizer.param_groups[2]['lr'] = lr * config.router_lr_mult
 
-    # Unpack the single returned temp variable cleanly
     temp = temp_scheduler.step(iter_num)
-    if isinstance(temp, tuple):
-        temp = temp[0]
 
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
