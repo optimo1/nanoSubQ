@@ -31,9 +31,10 @@ min_lr = 5.0e-5
 weight_decay = 0.1
 max_grad_norm = 1.0      # the recipe the ssa repo trains with (was 0.5)
 
-# Research knob: anneal the routing temperature beta over training (e.g. (4.0, 2.0));
+# Research knob: anneal the routing temperature beta over training (4.0 -> 2.0).
 # None = keep config.beta fixed (the repo's measured optimum ~2).
-beta_anneal = None
+# Enabled by default: start more variance-seeking, settle at the measured optimum ~2.
+beta_anneal = (4.0, 2.0)
 
 config = nanoSubQConfig(
     vocab_size=50304,
@@ -47,6 +48,7 @@ config = nanoSubQConfig(
     local=1,
     beta=2.0,          # cumulant routing temperature
     attn_impl='flex',  # O(n*kappa) fused kernel; 'masked' = O(n^2) exact reference
+    label_smoothing=0.1,  # soften CE target -> every vocab token gets a gradient
     dropout=0.0,
 )
 

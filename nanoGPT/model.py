@@ -38,6 +38,7 @@ class nanoSubQConfig:
     local: int = 1           # always keep own block + this many preceding blocks
     beta: float = 2.0        # cumulant temperature (repo measured optimum ~2)
     attn_impl: str = 'flex'  # 'flex' = O(n*kappa) fused kernel; 'masked' = O(n^2) exact reference
+    label_smoothing: float = 0.1   # soften the CE target so EVERY vocab token gets a gradient
     dropout: float = 0.0
 
 
@@ -225,6 +226,7 @@ class nanoSubQ(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100,
+                label_smoothing=self.config.label_smoothing,
             ).unsqueeze(0)
         return logits, loss, sparsity, entropy, load
