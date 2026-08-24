@@ -2,6 +2,7 @@ import os
 import time
 import math
 import gc
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,6 +10,11 @@ from model import nanoSubQ, nanoSubQConfig
 
 data_dir = 'data'
 out_dir = 'out'
+
+ap = argparse.ArgumentParser(description="Train nanoSubQ (near-linear content-routed attention).")
+ap.add_argument('--resume', type=str, default=None,
+                help="checkpoint .pt, or a dir containing ckpt_step_*.pt, to resume from (continue training)")
+args = ap.parse_args()
 
 micro_batch_size = 16
 gradient_accumulation_steps = 2
@@ -18,9 +24,9 @@ block_size = 1024
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r')
 
-# ~5h on 2x T4 (fp16): 16000 iters ≈ 5h at ~1.1 s/step (n=1024 doubles tokens/step vs the old n=512).
-# Tune with: iters ≈ 5h/(s per step).
-max_iters = 16000
+# ~8.8h on 2x T4 (fp16): 28000 iters ≈ one full epoch over the ~922M-token train.bin at ~1.1 s/step.
+# Overnight target. Tune with: iters ≈ hours*3600/(s per step).
+max_iters = 28000
 eval_interval = 2500
 log_interval = 20
 eval_iters = 50
@@ -123,6 +129,28 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1 and config.attn_i
         torch.cuda.empty_cache()
     print(f"pre-compiled flex kernel (fwd+bwd) on {torch.cuda.device_count()} GPUs")
 
+# Resume: restore model weights, optimizer (AdamW momentum), scaler and step counter from a
+# previous run. If the session dies (e.g. Kaggle's 12h cap), rerun with `--resume out` to continue
+# exactly where it stopped — LR schedule position and optimizer state intact. max_iters can be
+# raised to train further. NOTE: checkpoint must survive the session end (see 'out/' caveat).
+start_iter = 0
+if args.resume is not None:
+    ckpt_path = args.resume
+    if os.path.isdir(ckpt_path):
+        files = sorted(
+            (f for f in os.listdir(ckpt_path) if f.startswith('ckpt_step_') and f.endswith('.pt')),
+            key=lambda f: int(f[len('ckpt_step_'):-len('.pt')]),
+        )
+        assert files, f"no ckpt_step_*.pt found in {ckpt_path}"
+        ckpt_path = os.path.join(ckpt_path, files[-1])
+    print(f"resuming from {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    raw_model.load_state_dict(ckpt['model'])
+    optimizer.load_state_dict(ckpt['optimizer'])
+    scaler.load_state_dict(ckpt['scaler'])
+    start_iter = int(ckpt['iter'])
+    print(f"resumed at step {start_iter}/{max_iters}")
+
 def get_lr(it):
     if it < warmup_iters:
         return learning_rate * (it + 1) / warmup_iters
@@ -135,7 +163,7 @@ def get_lr(it):
 model.train()
 t0 = time.time()
 
-for iter_num in range(1, max_iters + 1):
+for iter_num in range(start_iter + 1, max_iters + 1):
     lr = get_lr(iter_num)
 
     optimizer.param_groups[0]['lr'] = lr
@@ -206,7 +234,14 @@ for iter_num in range(1, max_iters + 1):
             print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")
 
             ckpt_path = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
-            torch.save(raw_model.state_dict(), ckpt_path)
+            torch.save({
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'iter': iter_num,
+                'config': config,
+            }, ckpt_path)
+            print(f"  saved {ckpt_path}")
 
         torch.cuda.empty_cache()
         gc.collect()
