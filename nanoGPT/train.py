@@ -12,7 +12,7 @@ out_dir = 'out'
 
 micro_batch_size = 16   
 gradient_accumulation_steps = 2
-block_size = 512      
+block_size = 512        
 tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
@@ -20,14 +20,14 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r
 
 # --- Quick Dry Run Config ---
 max_iters = 50           # Run for only 50 steps
-eval_interval = 25       # Run validation twice (at step 25 and step 50)
+eval_interval = 25       # Run validation at step 25 and 50
 log_interval = 5         # Print logs every 5 steps
-eval_iters = 5           # Keep validation fast (5 batches instead of 50)        # Scale down LR warmup for the short run
+eval_iters = 5           # Keep validation fast
+warmup_iters = 10        # Scale down LR warmup
 
 learning_rate = 3e-4  
 min_lr = 3e-5        
 weight_decay = 0.1
-warmup_iters = 10  
 max_grad_norm = 1.0  
 
 t_max = 2.0
@@ -36,11 +36,11 @@ t_decay_rate = 3.0
 
 config = nanoSubQConfig(
     vocab_size=50304,
-    max_seq_len=1024,  # RoPE precomputes up to 1024 for generation headroom
+    max_seq_len=1024,
     d_model=384,        
     num_layers=6,       
     num_q_heads=6,      
-    num_kv_heads=2,      
+    num_kv_heads=2,     
     window_size=8,
     dropout=0.0,
 )
@@ -140,8 +140,8 @@ for iter_num in range(1, max_iters + 1):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        avg_loss = accum_loss / gradient_accumulation_steps
-        avg_entropy = accum_entropy / gradient_accumulation_steps
+        avg_loss = accum_loss
+        avg_entropy = accum_entropy
         print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
