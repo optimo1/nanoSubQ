@@ -65,71 +65,73 @@ class SubQAttention(nn.Module):
         self.router = nn.Linear(config.d_model, self.num_kv_heads)
 
     def forward(self, x, cos, sin):
-        B, S, D = x.shape
-
-        q = self.q_proj(x).view(B, S, self.num_q_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        q_rot = apply_rotary_emb(q, cos[:, :, :S, :], sin[:, :, :S, :])
-        k_rot = apply_rotary_emb(k, cos[:, :, :S, :], sin[:, :, :S, :])
-
-        router_logits = torch.clamp(self.router(x), -10.0, 10.0) / self.temperature
-        router_scores = torch.sigmoid(router_logits).transpose(1, 2)  
-
-        p_fp32 = router_scores.float()
-        p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
-
-        entropy = -(p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
-        usage_penalty = (p_fp32.mean() - self.usage_target).pow(2).unsqueeze(0)
-
-        hist_len = max(0, S - self.window_size)
-
-        if hist_len > 0:
-            hist_scores = router_scores[:, :, :hist_len]
-            k_hist = max(1, int(hist_len * self.k_ratio))
-            _, topk_indices = torch.topk(hist_scores, k=k_hist, dim=-1)
-
-            local_indices = torch.arange(hist_len, S, device=x.device).unsqueeze(0).unsqueeze(0).expand(B, self.num_kv_heads, -1)
-            kv_indices = torch.cat([topk_indices, local_indices], dim=-1)
-        else:
-            kv_indices = torch.arange(S, device=x.device).unsqueeze(0).unsqueeze(0).expand(B, self.num_kv_heads, -1)
-
-        kv_indices_sorted, _ = torch.sort(kv_indices, dim=-1)
-
-        gather_idx = kv_indices_sorted.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        k_rot_sparse = torch.gather(k_rot, dim=2, index=gather_idx)
-        v_sparse = torch.gather(v, dim=2, index=gather_idx)
-
-        # --- THE FIX: Straight-Through Identity Proxy ---
-        kv_scores = torch.gather(router_scores, dim=2, index=kv_indices_sorted)
-        kv_gate_proxy = kv_scores - kv_scores.detach() + 1.0
-
-        k_rot_sparse = k_rot_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
-        v_sparse = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
-        kv_gate_proxy = kv_gate_proxy.repeat_interleave(self.num_q_per_kv, dim=1)
-
-        # Forward pass applies exactly 1.0. Backward pass routes gradients perfectly.
-        v_sparse = v_sparse * kv_gate_proxy.unsqueeze(-1)
-
-        att_scores = torch.matmul(q_rot, k_rot_sparse.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        q_idx = torch.arange(S, device=x.device).view(1, 1, S, 1)
-        kv_idx_expanded = kv_indices_sorted.repeat_interleave(self.num_q_per_kv, dim=1).unsqueeze(2)
-
-        causal_mask = kv_idx_expanded > q_idx
-
-        mask_val = -1e4 if att_scores.dtype in (torch.float16, torch.bfloat16) else -1e9
-        att_scores = att_scores.masked_fill(causal_mask, mask_val)
-        att_weights = F.softmax(att_scores, dim=-1)
-
-        has_valid_keys = (~causal_mask).any(dim=-1, keepdim=True)
-        att_weights = att_weights * has_valid_keys.float()
-
-        out = torch.matmul(att_weights, v_sparse)
-        out = out.transpose(1, 2).contiguous().view(B, S, D)
-
-        return self.out_proj(out), entropy, usage_penalty
+            B, S, D = x.shape
+    
+            q = self.q_proj(x).view(B, S, self.num_q_heads, self.head_dim).transpose(1, 2)
+            k = self.k_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+    
+            q_rot = apply_rotary_emb(q, cos[:, :, :S, :], sin[:, :, :S, :])
+            k_rot = apply_rotary_emb(k, cos[:, :, :S, :], sin[:, :, :S, :])
+    
+            router_logits = torch.clamp(self.router(x), -10.0, 10.0) / self.temperature
+            router_scores = torch.sigmoid(router_logits).transpose(1, 2)  
+    
+            p_fp32 = router_scores.float()
+            p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
+    
+            entropy = -(p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
+            usage_penalty = (p_fp32.mean() - self.usage_target).pow(2).unsqueeze(0)
+    
+            hist_len = max(0, S - self.window_size)
+    
+            if hist_len > 0:
+                hist_scores = router_scores[:, :, :hist_len]
+                k_hist = max(1, int(hist_len * self.k_ratio))
+                _, topk_indices = torch.topk(hist_scores, k=k_hist, dim=-1)
+    
+                local_indices = torch.arange(hist_len, S, device=x.device).unsqueeze(0).unsqueeze(0).expand(B, self.num_kv_heads, -1)
+                kv_indices = torch.cat([topk_indices, local_indices], dim=-1)
+            else:
+                kv_indices = torch.arange(S, device=x.device).unsqueeze(0).unsqueeze(0).expand(B, self.num_kv_heads, -1)
+    
+            kv_indices_sorted, _ = torch.sort(kv_indices, dim=-1)
+    
+            gather_idx = kv_indices_sorted.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+            k_rot_sparse = torch.gather(k_rot, dim=2, index=gather_idx)
+            v_sparse = torch.gather(v, dim=2, index=gather_idx)
+    
+            # --- THE FIX: Attention Prior Bias ---
+            # Gather the router scores for the selected keys
+            kv_scores = torch.gather(router_scores, dim=2, index=kv_indices_sorted)
+    
+            k_rot_sparse = k_rot_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
+            v_sparse = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
+            
+            # Expand the routing scores to match the query heads
+            kv_scores_expanded = kv_scores.repeat_interleave(self.num_q_per_kv, dim=1).unsqueeze(2)
+    
+            att_scores = torch.matmul(q_rot, k_rot_sparse.transpose(-2, -1)) / math.sqrt(self.head_dim)
+    
+            # Inject the router's soft probability as a learned prior directly into the attention scores
+            att_scores = att_scores + torch.log(kv_scores_expanded + 1e-9)
+    
+            q_idx = torch.arange(S, device=x.device).view(1, 1, S, 1)
+            kv_idx_expanded = kv_indices_sorted.repeat_interleave(self.num_q_per_kv, dim=1).unsqueeze(2)
+    
+            causal_mask = kv_idx_expanded > q_idx
+    
+            mask_val = -1e4 if att_scores.dtype in (torch.float16, torch.bfloat16) else -1e9
+            att_scores = att_scores.masked_fill(causal_mask, mask_val)
+            att_weights = F.softmax(att_scores, dim=-1)
+    
+            has_valid_keys = (~causal_mask).any(dim=-1, keepdim=True)
+            att_weights = att_weights * has_valid_keys.float()
+    
+            out = torch.matmul(att_weights, v_sparse)
+            out = out.transpose(1, 2).contiguous().view(B, S, D)
+    
+            return self.out_proj(out), entropy, usage_penalty
 
 class Block(nn.Module):
     def __init__(self, config: nanoSubQConfig):
