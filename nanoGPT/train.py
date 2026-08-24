@@ -14,8 +14,9 @@ micro_batch_size = 16
 gradient_accumulation_steps = 2
 block_size = 512
 
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# data/prepare.py writes uint32; read as uint32 (reading as uint16 corrupts every other token to 0)
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r')
 
 max_iters = 50000
 eval_interval = 2500
