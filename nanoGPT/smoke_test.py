@@ -47,4 +47,14 @@ s = sparsity.item()
 assert 0.0 < s <= 1.0, f"sparsity {s} out of (0,1]"
 print(f"3. loss {first_loss:.3f} -> {l:.3f}; sparsity {s:.3f}")
 assert l < first_loss, "loss did not decrease"
+
+# 4. autocast forward: flex_attention must not reject mixed dtypes.
+# Regression: fp32 RoPE tables promoted q/k to fp32 under fp16/bf16 autocast while v stayed
+# low-precision -> ValueError "Expected query, key, and value to have the same dtype"
+# (crashed train.py on the 2xT4/Kaggle box). apply_rotary_emb now casts tables to x.dtype.
+with torch.amp.autocast(device_type='cpu', dtype=torch.bfloat16):
+    logits_a, loss_a, sp_a, ent_a, ld_a = m(idx, tgt)
+assert torch.isfinite(loss_a), "non-finite loss under autocast"
+assert torch.isfinite(sp_a) and torch.isfinite(ent_a) and torch.isfinite(ld_a), "non-finite diagnostic under autocast"
+print(f"4. autocast forward OK (loss {loss_a.item():.3f}, dtypes uniform)")
 print("SMOKE TEST PASSED")

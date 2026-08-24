@@ -50,7 +50,13 @@ config = nanoSubQConfig(
 )
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-ptdtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+# bf16 needs sm_80+ (A100/L4/...). T4 is sm_75 -> no bf16 hardware; must use fp16 + GradScaler.
+# Check the capability directly: torch.cuda.is_bf16_supported() can wrongly report True on T4.
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability(0)
+    ptdtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+else:
+    ptdtype = torch.float16
 scaler = torch.amp.GradScaler('cuda', enabled=(ptdtype == torch.float16))
 
 print(f"Using device: {device} | Precision: {ptdtype}")

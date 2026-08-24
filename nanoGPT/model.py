@@ -39,10 +39,15 @@ class nanoSubQConfig:
 
 
 def apply_rotary_emb(x, cos, sin):
+    # Cast the fp32 RoPE tables to x's dtype. Otherwise (x * cos) promotes q/k to fp32
+    # under fp16/bf16 autocast while v stays low-precision -> flex_attention rejects the
+    # mixed q/k/v dtypes with a ValueError.
     d_half = x.shape[-1] // 2
     x1 = x[..., :d_half]
     x2 = x[..., d_half:]
     rotated_x = torch.cat((-x2, x1), dim=-1)
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     return (x * cos) + (rotated_x * sin)
 
 
