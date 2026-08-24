@@ -20,8 +20,9 @@ ap.add_argument('--resume', type=str, default=None,
                 help="checkpoint .pt, or a dir containing ckpt_step_*.pt, to resume from (continue training)")
 ap.add_argument('--kaggle-dataset', type=str, default=None,
                 help="owner/dataset to durably back up the latest checkpoint to after each eval "
-                     "(auto-creates the dataset on first push; needs KAGGLE_USERNAME/KAGGLE_KEY env "
-                     "from notebook Secrets and the `kaggle` CLI). Resume later with: "
+                     "(auto-creates the dataset on first push; needs the `kaggle` CLI and your "
+                     "Kaggle credentials in env: KAGGLE_API_TOKEN (notebook Secret, KGAT_... token) "
+                     "or the older KAGGLE_USERNAME/KAGGLE_KEY pair). Resume later with: "
                      "kaggle datasets download <owner>/<dataset> -p restore && unzip -o restore/*.zip -d restore "
                      "then: python train.py --resume restore/latest.pt")
 args = ap.parse_args()
