@@ -86,6 +86,7 @@ optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
 temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters)
 
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
     model = nn.DataParallel(raw_model).to(device)
 else:
     model = raw_model.to(device)
@@ -121,7 +122,9 @@ for iter_num in range(1, max_iters + 1):
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
             logits, ce_loss, entropy = model(x, targets=y)
-            total_loss = ce_loss.mean() - entropy_coef * entropy.mean()
+            # FIX: Changed from '-' to '+' so we MINIMIZE entropy. 
+            # Minimizing entropy pushes router scores to 0 or 1, stabilizing the hard STE mask.
+            total_loss = ce_loss.mean() + entropy_coef * entropy.mean()
             loss_scaled = total_loss / gradient_accumulation_steps  
 
         accum_loss += ce_loss.mean().item()

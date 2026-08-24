@@ -23,6 +23,7 @@ class StraightThroughEstimator(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # Pass gradients straight through to the router
         return grad_output
 
 class TemperatureScheduler:
@@ -62,10 +63,10 @@ class SubQAttention(nn.Module):
         self.temperature = 2.0
 
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.k_proj = nn.Linear(config.d_model, config.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.num_kv_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.d_model, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.d_model, self.num_kv_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.router = nn.Linear(config.d_model, config.num_kv_heads)
+        self.router = nn.Linear(config.d_model, self.num_kv_heads)
 
     def forward(self, x, cos, sin):
         B, S, D = x.shape
@@ -81,6 +82,7 @@ class SubQAttention(nn.Module):
         router_scores = torch.sigmoid(router_logits).transpose(1, 2)
         ste_weights = StraightThroughEstimator.apply(router_scores)
 
+        # FP32 computation prevents NaN underflow in reduced precision
         p_fp32 = router_scores.float()
         p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
         entropy = - (p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
@@ -88,7 +90,8 @@ class SubQAttention(nn.Module):
         hist_len = max(0, S - self.window_size)
         
         if hist_len > 0:
-            hist_scores = router_scores.detach()[:, :, :hist_len]
+            # FIX: Removed .detach() so top-k value gradients can flow back to the router
+            hist_scores = router_scores[:, :, :hist_len]
             k_hist = max(1, int(hist_len * self.k_ratio))
             _, topk_indices = torch.topk(hist_scores, k=k_hist, dim=-1)
 
@@ -115,12 +118,14 @@ class SubQAttention(nn.Module):
 
         att_scores = att_scores.masked_fill(causal_mask, float('-inf'))
         att_weights = F.softmax(att_scores, dim=-1)
+        
+        # CRITICAL FIX: Convert NaN rows (where all keys were masked out) to 0.0
         att_weights = torch.nan_to_num(att_weights, nan=0.0)
 
         out = torch.matmul(att_weights, v_sparse)
         
-        # Detach STE mask during multiplication to prevent router gradient corruption of attention states
-        out = out * q_ste_weights.detach().unsqueeze(-1)
+        # FIX: Removed .detach() so the LM loss can backpropagate through the STE to the router
+        out = out * q_ste_weights.unsqueeze(-1)
         
         out = out.transpose(1, 2).contiguous().view(B, S, D)
 
