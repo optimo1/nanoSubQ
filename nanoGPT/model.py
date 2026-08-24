@@ -16,6 +16,13 @@ class nanoSubQConfig:
     k_ratio: float = 0.5
     dropout: float = 0.0
 
+    # --- Router stability controls ---
+    hard_gate: bool = False          
+    ste_scale: float = 0.5           
+    router_lr_mult: float = 0.5      
+    usage_target: float = 0.5        
+    gate_warmup_steps: int = 2000    
+
 class ScaledSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -23,24 +30,30 @@ class ScaledSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Scale down router gradients to prevent unstable loss spikes
-        return grad_output * 0.1
+        return grad_output * ScaledSTE.grad_scale
+
+ScaledSTE.grad_scale = 0.5  
 
 class TemperatureScheduler:
-    def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000, **kwargs):
+    def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000,
+                 gate_warmup_steps=2000, **kwargs):
         self.model = model
         self.t_max = t_max
         self.t_min = t_min
         self.total_steps = total_steps
+        self.gate_warmup_steps = max(1, gate_warmup_steps)
 
     def step(self, current_step):
         progress = min(1.0, max(0.0, current_step / self.total_steps))
         temp = self.t_max - progress * (self.t_max - self.t_min)
-        
+
+        gate_scale = min(1.0, current_step / self.gate_warmup_steps)
+
         target_model = self.model.module if hasattr(self.model, 'module') else self.model
         for block in target_model.layers:
             block.attn.temperature = temp
-        return temp
+            block.attn.gate_scale = gate_scale
+        return temp, gate_scale
 
 def apply_rotary_emb(x, cos, sin):
     d_half = x.shape[-1] // 2
@@ -60,7 +73,11 @@ class SubQAttention(nn.Module):
         self.head_dim = config.d_model // config.num_q_heads
         self.window_size = config.window_size
         self.k_ratio = config.k_ratio
+        self.hard_gate = config.hard_gate
+        self.usage_target = config.usage_target
+
         self.temperature = 2.0
+        self.gate_scale = 0.0  
 
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.k_proj = nn.Linear(config.d_model, self.num_kv_heads * self.head_dim, bias=False)
@@ -79,21 +96,17 @@ class SubQAttention(nn.Module):
         k_rot = apply_rotary_emb(k, cos[:, :, :S, :], sin[:, :, :S, :])
 
         router_logits = torch.clamp(self.router(x), -10.0, 10.0) / self.temperature
-        router_scores = torch.sigmoid(router_logits).transpose(1, 2)
-        
-        # Pass through Scaled STE so main task loss trains the router safely
-        ste_weights = ScaledSTE.apply(router_scores)
+        router_scores = torch.sigmoid(router_logits).transpose(1, 2)  
 
-        # FP32 computation prevents NaN underflow in reduced precision
         p_fp32 = router_scores.float()
         p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
-        entropy = - (p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
+
+        entropy = -(p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
+        usage_penalty = (p_fp32.mean() - self.usage_target).pow(2).unsqueeze(0)
 
         hist_len = max(0, S - self.window_size)
-        
+
         if hist_len > 0:
-            # NOTE: topk selection returns integer indices and is non-differentiable.
-            # Router gradients flow exclusively through `ste_weights` and the entropy regularizer.
             hist_scores = router_scores[:, :, :hist_len]
             k_hist = max(1, int(hist_len * self.k_ratio))
             _, topk_indices = torch.topk(hist_scores, k=k_hist, dim=-1)
@@ -109,7 +122,16 @@ class SubQAttention(nn.Module):
         k_rot_sparse = torch.gather(k_rot, dim=2, index=gather_idx)
         v_sparse = torch.gather(v, dim=2, index=gather_idx)
 
-        q_ste_weights = ste_weights.repeat_interleave(self.num_q_per_kv, dim=1)
+        if self.hard_gate:
+            ste_weights = ScaledSTE.apply(router_scores)
+            soft_or_hard_gate = ste_weights
+        else:
+            soft_or_hard_gate = router_scores
+
+        ones = torch.ones_like(soft_or_hard_gate)
+        blended_gate = self.gate_scale * soft_or_hard_gate + (1.0 - self.gate_scale) * ones
+
+        q_gate = blended_gate.repeat_interleave(self.num_q_per_kv, dim=1)
         k_rot_sparse = k_rot_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
         v_sparse = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
 
@@ -117,23 +139,19 @@ class SubQAttention(nn.Module):
 
         q_idx = torch.arange(S, device=x.device).view(1, 1, S, 1)
         kv_idx_expanded = kv_indices_sorted.repeat_interleave(self.num_q_per_kv, dim=1).unsqueeze(2)
-        
-        # Safe broadcast to shape [B, num_q_heads, S, K]
+
         causal_mask = kv_idx_expanded > q_idx
 
-        att_scores = att_scores.masked_fill(causal_mask, float('-inf'))
+        # Safe masking without NaN gradient propagation
+        mask_val = -1e4 if att_scores.dtype in (torch.float16, torch.bfloat16) else -1e9
+        att_scores = att_scores.masked_fill(causal_mask, mask_val)
         att_weights = F.softmax(att_scores, dim=-1)
-        
-        # CRITICAL FIX: Convert NaN rows (where all keys were masked out) to 0.0
-        att_weights = torch.nan_to_num(att_weights, nan=0.0)
 
         out = torch.matmul(att_weights, v_sparse)
-        
-        out = out * q_ste_weights.unsqueeze(-1)
-        
+        out = out * q_gate.unsqueeze(-1)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
 
-        return self.out_proj(out), entropy
+        return self.out_proj(out), entropy, usage_penalty
 
 class Block(nn.Module):
     def __init__(self, config: nanoSubQConfig):
@@ -148,15 +166,17 @@ class Block(nn.Module):
         )
 
     def forward(self, x, cos, sin):
-        attn_out, entropy = self.attn(self.ln1(x), cos, sin)
+        attn_out, entropy, usage_penalty = self.attn(self.ln1(x), cos, sin)
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
-        return x, entropy
+        return x, entropy, usage_penalty
 
 class nanoSubQ(nn.Module):
     def __init__(self, config: nanoSubQConfig):
         super().__init__()
         self.config = config
+        ScaledSTE.grad_scale = config.ste_scale
+
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         self.ln_f = nn.LayerNorm(config.d_model)
@@ -167,28 +187,38 @@ class nanoSubQ(nn.Module):
         t = torch.arange(config.max_seq_len).float()
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer('cos', emb.cos().unsqueeze(0).unsqueeze(0), persistent=False)
-        self.register_buffer('sin', emb.sin().unsqueeze(0).unsqueeze(0), persistent=False)
+        
+        # persistent=True prevents DataParallel crash
+        self.register_buffer('cos', emb.cos().unsqueeze(0).unsqueeze(0), persistent=True)
+        self.register_buffer('sin', emb.sin().unsqueeze(0).unsqueeze(0), persistent=True)
 
     def forward(self, idx, targets=None):
         B, S = idx.shape
         x = self.tok_emb(idx)
 
+        # Directly slice; do not use .to(x.device) here to prevent DataParallel transfer errors
         cos = self.cos[:, :, :S, :]
         sin = self.sin[:, :, :S, :]
 
         total_entropy = 0.0
+        total_usage_penalty = 0.0
         for layer in self.layers:
-            x, entropy = layer(x, cos, sin)
+            x, entropy, usage_penalty = layer(x, cos, sin)
             total_entropy = total_entropy + entropy.mean()
+            total_usage_penalty = total_usage_penalty + usage_penalty.mean()
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
         avg_entropy = (total_entropy / self.config.num_layers).unsqueeze(0)
+        avg_usage_penalty = (total_usage_penalty / self.config.num_layers).unsqueeze(0)
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)).unsqueeze(0)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1), 
+                ignore_index=-100
+            ).unsqueeze(0)
 
-        return logits, loss, avg_entropy
+        return logits, loss, avg_entropy, avg_usage_penalty

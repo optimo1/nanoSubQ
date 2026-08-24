@@ -10,37 +10,45 @@ from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
 data_dir = 'data'
 out_dir = 'out'
 
-micro_batch_size = 16   
+micro_batch_size = 16
 gradient_accumulation_steps = 2
-block_size = 512        
+block_size = 512
 
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-max_iters = 50000         
-eval_interval = 2500       
-log_interval = 20         
-eval_iters = 50            
-warmup_iters = 1000        
+max_iters = 50000
+eval_interval = 2500
+log_interval = 20
+eval_iters = 50
+warmup_iters = 2000  # Restored to 2000
 
-learning_rate = 3.0e-5     # Decreased to 3e-5 for rock-solid stability
-min_lr = 3.0e-6        
+learning_rate = 3.0e-4   # Lower peak LR for stability early on
+min_lr = 3.0e-5          
 weight_decay = 0.1
-max_grad_norm = 0.25       
-entropy_coef = 0.01        
+max_grad_norm = 0.5      
+
+entropy_coef = 0.0
+usage_coef = 0.01
 
 t_max = 2.0
 t_min = 0.1
+gate_warmup_steps = 2000  
 
 config = nanoSubQConfig(
     vocab_size=50304,
     max_seq_len=1024,
-    d_model=384,        
-    num_layers=6,       
-    num_q_heads=6,      
-    num_kv_heads=2,     
+    d_model=384,
+    num_layers=6,
+    num_q_heads=6,
+    num_kv_heads=2,
     window_size=8,
     dropout=0.0,
+    hard_gate=False,        
+    ste_scale=0.5,          
+    router_lr_mult=0.5,     
+    usage_target=0.5,
+    gate_warmup_steps=gate_warmup_steps,
 )
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -59,7 +67,7 @@ def get_batch(split):
 
 raw_model = nanoSubQ(config)
 
-def configure_optimizer(model, weight_decay, learning_rate):
+def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
     decay_params = []
     no_decay_params = []
     router_params = []
@@ -77,13 +85,16 @@ def configure_optimizer(model, weight_decay, learning_rate):
     optim_groups = [
         {"params": decay_params, "weight_decay": weight_decay, "lr": learning_rate},
         {"params": no_decay_params, "weight_decay": 0.0, "lr": learning_rate},
-        {"params": router_params, "weight_decay": 0.0, "lr": learning_rate * 0.1}, # 10x smaller LR for router
+        {"params": router_params, "weight_decay": 0.0, "lr": learning_rate * router_lr_mult},
     ]
 
     return torch.optim.AdamW(optim_groups, betas=(0.9, 0.95))
 
-optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
-temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters)
+optimizer = configure_optimizer(raw_model, weight_decay, learning_rate, config.router_lr_mult)
+temp_scheduler = TemperatureScheduler(
+    raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters,
+    gate_warmup_steps=gate_warmup_steps,
+)
 
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
@@ -105,31 +116,32 @@ t0 = time.time()
 
 for iter_num in range(1, max_iters + 1):
     lr = get_lr(iter_num)
-    
-    # Scale main parameters and router parameters proportionately
+
     optimizer.param_groups[0]['lr'] = lr
     optimizer.param_groups[1]['lr'] = lr
-    optimizer.param_groups[2]['lr'] = lr * 0.1
-    
-    temp = temp_scheduler.step(iter_num)
+    optimizer.param_groups[2]['lr'] = lr * config.router_lr_mult
+
+    temp, gate_scale = temp_scheduler.step(iter_num)
 
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
     accum_entropy = 0.0
+    accum_usage = 0.0
 
     for micro_step in range(gradient_accumulation_steps):
         x, y = get_batch('train')
-        
+
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-            logits, ce_loss, entropy = model(x, targets=y)
-            # FIX: Changed from '-' to '+' so we MINIMIZE entropy. 
-            # Minimizing entropy pushes router scores to 0 or 1, stabilizing the hard STE mask.
-            total_loss = ce_loss.mean() + entropy_coef * entropy.mean()
-            loss_scaled = total_loss / gradient_accumulation_steps  
+            logits, ce_loss, entropy, usage_penalty = model(x, targets=y)
+            total_loss = ce_loss.mean() + usage_coef * usage_penalty.mean()
+            if entropy_coef > 0.0:
+                total_loss = total_loss + entropy_coef * entropy.mean()
+            loss_scaled = total_loss / gradient_accumulation_steps
 
         accum_loss += ce_loss.mean().item()
         accum_entropy += entropy.mean().item()
-        
+        accum_usage += usage_penalty.mean().item()
+
         if ptdtype == torch.float16:
             scaler.scale(loss_scaled).backward()
         else:
@@ -143,14 +155,17 @@ for iter_num in range(1, max_iters + 1):
     else:
         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
-    
+
     if iter_num % log_interval == 0:
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
         avg_loss = accum_loss / gradient_accumulation_steps
         avg_entropy = accum_entropy / gradient_accumulation_steps
-        print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
+        avg_usage = accum_usage / gradient_accumulation_steps
+        print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | "
+              f"usage_pen {avg_usage:.4f} | lr {lr:.6f} | temp {temp:.2f} | gate {gate_scale:.2f} | "
+              f"time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
@@ -159,14 +174,14 @@ for iter_num in range(1, max_iters + 1):
             for _ in range(eval_iters):
                 x_v, y_v = get_batch('val')
                 with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-                    _, v_loss, _ = model(x_v, targets=y_v)
+                    _, v_loss, _, _ = model(x_v, targets=y_v)
                 val_losses.append(v_loss.mean().item())
             mean_val_loss = sum(val_losses) / len(val_losses)
             print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")
-            
+
             ckpt_path = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
             torch.save(raw_model.state_dict(), ckpt_path)
-            
+
         torch.cuda.empty_cache()
         gc.collect()
         model.train()
