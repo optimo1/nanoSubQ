@@ -5,7 +5,7 @@ import gc
 import numpy as np
 import torch
 import torch.nn as nn
-from model import nanoSubQ, nanoSubQConfig, TemperatureScheduler
+from model import nanoSubQ, nanoSubQConfig
 
 data_dir = 'data'
 out_dir = 'out'
@@ -18,22 +18,17 @@ block_size = 512
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r')
 
-max_iters = 50000
+# ~5h on 2x T4 (fp16): 35000 iters ≈ 5-7h at ~0.5-0.7 s/step. Tune with: iters ≈ 5h/(s per step).
+max_iters = 35000
 eval_interval = 2500
 log_interval = 20
 eval_iters = 50
 warmup_iters = 1000
 
-learning_rate = 5.0e-4   
-min_lr = 5.0e-5          
+learning_rate = 5.0e-4
+min_lr = 5.0e-5
 weight_decay = 0.1
-max_grad_norm = 0.5      
-
-entropy_coef = 0.0
-usage_coef = 0.01
-
-t_max = 2.0
-t_min = 0.1
+max_grad_norm = 1.0      # the recipe the ssa repo trains with (was 0.5)
 
 config = nanoSubQConfig(
     vocab_size=50304,
@@ -42,10 +37,10 @@ config = nanoSubQConfig(
     num_layers=6,
     num_q_heads=6,
     num_kv_heads=2,
-    window_size=8,
+    block=32,     # routing block size; 512 // 32 = 16 blocks
+    top_c=8,      # ~50% of causally-visible blocks selected + local window
+    local=1,
     dropout=0.0,
-    router_lr_mult=0.5,     
-    usage_target=0.5,
 )
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -64,17 +59,14 @@ def get_batch(split):
 
 raw_model = nanoSubQ(config)
 
-def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
+def configure_optimizer(model, weight_decay, learning_rate):
     decay_params = []
     no_decay_params = []
-    router_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "router" in name:
-            router_params.append(param)
-        elif param.ndim < 2 or "temperature" in name or "ln" in name:
+        if param.ndim < 2 or "ln" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -82,15 +74,11 @@ def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
     optim_groups = [
         {"params": decay_params, "weight_decay": weight_decay, "lr": learning_rate},
         {"params": no_decay_params, "weight_decay": 0.0, "lr": learning_rate},
-        {"params": router_params, "weight_decay": 0.0, "lr": learning_rate * router_lr_mult},
     ]
 
     return torch.optim.AdamW(optim_groups, betas=(0.9, 0.95))
 
-optimizer = configure_optimizer(raw_model, weight_decay, learning_rate, config.router_lr_mult)
-temp_scheduler = TemperatureScheduler(
-    raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters
-)
+optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
 
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
@@ -115,28 +103,20 @@ for iter_num in range(1, max_iters + 1):
 
     optimizer.param_groups[0]['lr'] = lr
     optimizer.param_groups[1]['lr'] = lr
-    optimizer.param_groups[2]['lr'] = lr * config.router_lr_mult
-
-    temp = temp_scheduler.step(iter_num)
 
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
-    accum_entropy = 0.0
-    accum_usage = 0.0
+    accum_sparsity = 0.0
 
     for micro_step in range(gradient_accumulation_steps):
         x, y = get_batch('train')
 
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-            logits, ce_loss, entropy, usage_penalty = model(x, targets=y)
-            total_loss = ce_loss.mean() + usage_coef * usage_penalty.mean()
-            if entropy_coef > 0.0:
-                total_loss = total_loss + entropy_coef * entropy.mean()
-            loss_scaled = total_loss / gradient_accumulation_steps
+            logits, ce_loss, sparsity = model(x, targets=y)
+            loss_scaled = ce_loss.mean() / gradient_accumulation_steps
 
         accum_loss += ce_loss.mean().item()
-        accum_entropy += entropy.mean().item()
-        accum_usage += usage_penalty.mean().item()
+        accum_sparsity += sparsity.mean().item()
 
         if ptdtype == torch.float16:
             scaler.scale(loss_scaled).backward()
@@ -157,11 +137,9 @@ for iter_num in range(1, max_iters + 1):
         dt = t1 - t0
         t0 = t1
         avg_loss = accum_loss / gradient_accumulation_steps
-        avg_entropy = accum_entropy / gradient_accumulation_steps
-        avg_usage = accum_usage / gradient_accumulation_steps
-        print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | "
-              f"usage_pen {avg_usage:.4f} | lr {lr:.6f} | temp {temp:.2f} | "
-              f"time {dt*1000/log_interval:.2f}ms/step")
+        avg_sparsity = accum_sparsity / gradient_accumulation_steps
+        print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | sparsity {avg_sparsity:.3f} | "
+              f"lr {lr:.6f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
@@ -170,7 +148,7 @@ for iter_num in range(1, max_iters + 1):
             for _ in range(eval_iters):
                 x_v, y_v = get_batch('val')
                 with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-                    _, v_loss, _, _ = model(x_v, targets=y_v)
+                    _, v_loss, _ = model(x_v, targets=y_v)
                 val_losses.append(v_loss.mean().item())
             mean_val_loss = sum(val_losses) / len(val_losses)
             print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")

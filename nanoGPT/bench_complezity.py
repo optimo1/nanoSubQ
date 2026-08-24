@@ -25,7 +25,6 @@ for seq_len in sequence_lengths:
         num_layers=4,
         num_q_heads=4,
         num_kv_heads=2,
-        window_size=8,
     )
     model = nanoSubQ(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
