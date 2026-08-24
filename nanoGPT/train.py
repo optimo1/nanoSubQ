@@ -15,28 +15,28 @@ out_dir = 'out'
 
 micro_batch_size = 16   
 gradient_accumulation_steps = 2 # Effective batch size = 32 (16,384 tokens / iter)
-block_size = 512     
+block_size = 512      
 tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 
 # Load binary dataset mappings
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# Target sprint length: ~2,500 steps is optimal for a solid high-speed training run (~1 hour)
-max_iters = 10000
+# Target sprint length: 24,000 steps (~10 hours @ ~1.5s/step)
+max_iters = 24000
 
 print(f"Total tokens available in train.bin: {len(train_data):,}")
 print(f"Target training run length: {max_iters:,} steps (~{max_iters * tokens_per_iter:,} tokens)")
 
-eval_interval = 1000  # Evaluate and save checkpoint every 500 steps
+eval_interval = 2000  # Evaluate and save checkpoint every 2,000 steps (~50 mins)
 log_interval = 20
 eval_iters = 50
 
-# Learning Rate & Optimizer Config (Scaled for a fast convergence sprint)
-learning_rate = 1e-3 
-min_lr = 1e-4        
+# Learning Rate & Optimizer Config (Scaled for a extended 10-hour run)
+learning_rate = 6e-4  # Slower peak LR to prevent loss plateaus on longer runs
+min_lr = 6e-5        # 10% of peak learning rate
 weight_decay = 0.1
-warmup_iters = 100   # Quick warmup so the model picks up speed immediately
+warmup_iters = 500    # Extended warmup over ~12 minutes for stable initial convergence
 max_grad_norm = 1.0  
 
 # Temperature Schedule Config (Exponential Decay: 2.0 -> 0.1)
@@ -96,6 +96,8 @@ def configure_optimizer(model, weight_decay, learning_rate):
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
 
 optimizer = configure_optimizer(model, weight_decay, learning_rate)
+
+# Temperature Scheduler mapped over the full 24,000 steps
 temp_scheduler = TemperatureScheduler(model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
 
 def get_lr(it):
@@ -150,7 +152,7 @@ for iter_num in range(1, max_iters + 1):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        print(f"step {iter_num:4d}/{max_iters} | loss {accum_loss:.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
+        print(f"step {iter_num:5d}/{max_iters} | loss {accum_loss:.4f} | entropy {entropy.item():.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
