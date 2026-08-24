@@ -24,9 +24,9 @@ block_size = 1024
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r')
 
-# ~8.8h on 2x T4 (fp16): 28000 iters ≈ one full epoch over the ~922M-token train.bin at ~1.1 s/step.
-# Overnight target. Tune with: iters ≈ hours*3600/(s per step).
-max_iters = 28000
+# ~5h on 2x T4 (fp16): 16000 iters ≈ 524M tokens (~57% of the 922M-token train.bin) at ~1.1 s/step.
+# Experiment budget. Tune with: iters ≈ hours*3600/(s per step).
+max_iters = 16000
 eval_interval = 2500
 log_interval = 20
 eval_iters = 50
