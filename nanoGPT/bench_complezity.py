@@ -41,7 +41,7 @@ for seq_len in sequence_lengths:
     model.train()
     for _ in range(num_warmup):
         optimizer.zero_grad(set_to_none=True)
-        _, loss, _ = model(x, targets=y)
+        _, loss, *_ = model(x, targets=y)
         loss.backward()
         optimizer.step()
     
@@ -52,7 +52,7 @@ for seq_len in sequence_lengths:
     t0 = time.perf_counter()
     for _ in range(num_bench):
         optimizer.zero_grad(set_to_none=True)
-        _, loss, _ = model(x, targets=y)
+        _, loss, *_ = model(x, targets=y)
         loss.backward()
         optimizer.step()
         

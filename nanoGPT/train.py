@@ -30,6 +30,10 @@ min_lr = 5.0e-5
 weight_decay = 0.1
 max_grad_norm = 1.0      # the recipe the ssa repo trains with (was 0.5)
 
+# Research knob: anneal the routing temperature beta over training (e.g. (4.0, 2.0));
+# None = keep config.beta fixed (the repo's measured optimum ~2).
+beta_anneal = None
+
 config = nanoSubQConfig(
     vocab_size=50304,
     max_seq_len=1024,
@@ -37,9 +41,11 @@ config = nanoSubQConfig(
     num_layers=6,
     num_q_heads=6,
     num_kv_heads=2,
-    block=32,     # routing block size; 512 // 32 = 16 blocks
-    top_c=8,      # ~50% of causally-visible blocks selected + local window
+    block=32,          # routing block size; 512 // 32 = 16 blocks
+    top_c=8,           # ~50% of causally-visible blocks selected + local window
     local=1,
+    beta=2.0,          # cumulant routing temperature
+    attn_impl='flex',  # O(n*kappa) fused kernel; 'masked' = O(n^2) exact reference
     dropout=0.0,
 )
 
@@ -104,19 +110,31 @@ for iter_num in range(1, max_iters + 1):
     optimizer.param_groups[0]['lr'] = lr
     optimizer.param_groups[1]['lr'] = lr
 
+    if beta_anneal is not None:
+        prog = max(0.0, min(1.0, (iter_num - warmup_iters) / (max_iters - warmup_iters)))
+        beta = beta_anneal[0] - prog * (beta_anneal[0] - beta_anneal[1])
+        for layer in raw_model.layers:
+            layer.attn.beta = beta
+    else:
+        beta = config.beta
+
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
     accum_sparsity = 0.0
+    accum_entropy = 0.0
+    accum_load = 0.0
 
     for micro_step in range(gradient_accumulation_steps):
         x, y = get_batch('train')
 
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-            logits, ce_loss, sparsity = model(x, targets=y)
+            logits, ce_loss, sparsity, entropy, load = model(x, targets=y)
             loss_scaled = ce_loss.mean() / gradient_accumulation_steps
 
         accum_loss += ce_loss.mean().item()
         accum_sparsity += sparsity.mean().item()
+        accum_entropy += entropy.mean().item()
+        accum_load += load.mean().item()
 
         if ptdtype == torch.float16:
             scaler.scale(loss_scaled).backward()
@@ -138,8 +156,11 @@ for iter_num in range(1, max_iters + 1):
         t0 = t1
         avg_loss = accum_loss / gradient_accumulation_steps
         avg_sparsity = accum_sparsity / gradient_accumulation_steps
+        avg_entropy = accum_entropy / gradient_accumulation_steps
+        avg_load = accum_load / gradient_accumulation_steps
         print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | sparsity {avg_sparsity:.3f} | "
-              f"lr {lr:.6f} | time {dt*1000/log_interval:.2f}ms/step")
+              f"entropy {avg_entropy:.3f} | load {avg_load:.2f} | beta {beta:.2f} | lr {lr:.6f} | "
+              f"time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:
         model.eval()
@@ -148,7 +169,7 @@ for iter_num in range(1, max_iters + 1):
             for _ in range(eval_iters):
                 x_v, y_v = get_batch('val')
                 with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-                    _, v_loss, _ = model(x_v, targets=y_v)
+                    _, v_loss, *_ = model(x_v, targets=y_v)
                 val_losses.append(v_loss.mean().item())
             mean_val_loss = sum(val_losses) / len(val_losses)
             print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")
