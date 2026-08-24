@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+
 @dataclass
 class nanoSubQConfig:
     vocab_size: int = 50304
@@ -17,11 +18,12 @@ class nanoSubQConfig:
     dropout: float = 0.0
 
     # --- Router stability controls ---
-    hard_gate: bool = False          
+    hard_gate: bool = True           # Fixed: Enables hard gating to preserve activation scale
     ste_scale: float = 0.5           
     router_lr_mult: float = 0.5      
     usage_target: float = 0.5        
     gate_warmup_steps: int = 2000    
+
 
 class ScaledSTE(torch.autograd.Function):
     @staticmethod
@@ -32,7 +34,9 @@ class ScaledSTE(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output * ScaledSTE.grad_scale
 
+
 ScaledSTE.grad_scale = 0.5  
+
 
 class TemperatureScheduler:
     def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000,
@@ -55,12 +59,14 @@ class TemperatureScheduler:
             block.attn.gate_scale = gate_scale
         return temp, gate_scale
 
+
 def apply_rotary_emb(x, cos, sin):
     d_half = x.shape[-1] // 2
     x1 = x[..., :d_half]
     x2 = x[..., d_half:]
     rotated_x = torch.cat((-x2, x1), dim=-1)
     return (x * cos) + (rotated_x * sin)
+
 
 class SubQAttention(nn.Module):
     def __init__(self, config: nanoSubQConfig):
@@ -142,16 +148,19 @@ class SubQAttention(nn.Module):
 
         causal_mask = kv_idx_expanded > q_idx
 
-        # Safe masking without NaN gradient propagation
         mask_val = -1e4 if att_scores.dtype in (torch.float16, torch.bfloat16) else -1e9
         att_scores = att_scores.masked_fill(causal_mask, mask_val)
         att_weights = F.softmax(att_scores, dim=-1)
+
+        has_valid_keys = (~causal_mask).any(dim=-1, keepdim=True)
+        att_weights = att_weights * has_valid_keys.float()
 
         out = torch.matmul(att_weights, v_sparse)
         out = out * q_gate.unsqueeze(-1)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
 
         return self.out_proj(out), entropy, usage_penalty
+
 
 class Block(nn.Module):
     def __init__(self, config: nanoSubQConfig):
@@ -171,6 +180,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x, entropy, usage_penalty
 
+
 class nanoSubQ(nn.Module):
     def __init__(self, config: nanoSubQConfig):
         super().__init__()
@@ -188,7 +198,7 @@ class nanoSubQ(nn.Module):
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         
-        # persistent=True prevents DataParallel crash
+        # Fixed: persistent=True prevents DataParallel replication failure
         self.register_buffer('cos', emb.cos().unsqueeze(0).unsqueeze(0), persistent=True)
         self.register_buffer('sin', emb.sin().unsqueeze(0).unsqueeze(0), persistent=True)
 
@@ -196,7 +206,6 @@ class nanoSubQ(nn.Module):
         B, S = idx.shape
         x = self.tok_emb(idx)
 
-        # Directly slice; do not use .to(x.device) here to prevent DataParallel transfer errors
         cos = self.cos[:, :, :S, :]
         sin = self.sin[:, :, :S, :]
 
@@ -216,9 +225,7 @@ class nanoSubQ(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                targets.view(-1), 
-                ignore_index=-100
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
             ).unsqueeze(0)
 
         return logits, loss, avg_entropy, avg_usage_penalty

@@ -21,10 +21,10 @@ max_iters = 50000
 eval_interval = 2500
 log_interval = 20
 eval_iters = 50
-warmup_iters = 2000  
+warmup_iters = 1000
 
-learning_rate = 3.0e-4   
-min_lr = 3.0e-5          
+learning_rate = 5.0e-4   
+min_lr = 5.0e-5          
 weight_decay = 0.1
 max_grad_norm = 0.5      
 
@@ -44,9 +44,8 @@ config = nanoSubQConfig(
     num_kv_heads=2,
     window_size=8,
     dropout=0.0,
-    # --- CRITICAL UPDATE HERE ---
-    hard_gate=True,         # Enabled Hard Gating to preserve attention magnitude
-    ste_scale=0.5,          # Maintain gradient scaling for the router
+    hard_gate=True,         # Fixed: Enforce hard gating to prevent magnitude drop at step 2000
+    ste_scale=0.5,          
     router_lr_mult=0.5,     
     usage_target=0.5,
     gate_warmup_steps=gate_warmup_steps,
@@ -59,6 +58,7 @@ scaler = torch.amp.GradScaler('cuda', enabled=(ptdtype == torch.float16))
 print(f"Using device: {device} | Precision: {ptdtype}")
 os.makedirs(out_dir, exist_ok=True)
 
+
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (micro_batch_size,))
@@ -66,7 +66,9 @@ def get_batch(split):
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     return x.to(device), y.to(device)
 
+
 raw_model = nanoSubQ(config)
+
 
 def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
     decay_params = []
@@ -91,6 +93,7 @@ def configure_optimizer(model, weight_decay, learning_rate, router_lr_mult):
 
     return torch.optim.AdamW(optim_groups, betas=(0.9, 0.95))
 
+
 optimizer = configure_optimizer(raw_model, weight_decay, learning_rate, config.router_lr_mult)
 temp_scheduler = TemperatureScheduler(
     raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters,
@@ -103,6 +106,7 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
 else:
     model = raw_model.to(device)
 
+
 def get_lr(it):
     if it < warmup_iters:
         return learning_rate * (it + 1) / warmup_iters
@@ -111,6 +115,7 @@ def get_lr(it):
     decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
+
 
 model.train()
 t0 = time.time()
