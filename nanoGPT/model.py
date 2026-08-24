@@ -16,15 +16,15 @@ class nanoSubQConfig:
     k_ratio: float = 0.5
     dropout: float = 0.0
 
-class StraightThroughEstimator(torch.autograd.Function):
+class ScaledSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         return (x >= 0.5).float()
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Pass gradients straight through to the router
-        return grad_output
+        # Scale down router gradients to prevent unstable loss spikes
+        return grad_output * 0.1
 
 class TemperatureScheduler:
     def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000, **kwargs):
@@ -80,7 +80,9 @@ class SubQAttention(nn.Module):
 
         router_logits = torch.clamp(self.router(x), -10.0, 10.0) / self.temperature
         router_scores = torch.sigmoid(router_logits).transpose(1, 2)
-        ste_weights = StraightThroughEstimator.apply(router_scores)
+        
+        # Pass through Scaled STE so main task loss trains the router safely
+        ste_weights = ScaledSTE.apply(router_scores)
 
         # FP32 computation prevents NaN underflow in reduced precision
         p_fp32 = router_scores.float()
@@ -90,7 +92,8 @@ class SubQAttention(nn.Module):
         hist_len = max(0, S - self.window_size)
         
         if hist_len > 0:
-            # FIX: Removed .detach() so top-k value gradients can flow back to the router
+            # NOTE: topk selection returns integer indices and is non-differentiable.
+            # Router gradients flow exclusively through `ste_weights` and the entropy regularizer.
             hist_scores = router_scores[:, :, :hist_len]
             k_hist = max(1, int(hist_len * self.k_ratio))
             _, topk_indices = torch.topk(hist_scores, k=k_hist, dim=-1)
@@ -114,6 +117,8 @@ class SubQAttention(nn.Module):
 
         q_idx = torch.arange(S, device=x.device).view(1, 1, S, 1)
         kv_idx_expanded = kv_indices_sorted.repeat_interleave(self.num_q_per_kv, dim=1).unsqueeze(2)
+        
+        # Safe broadcast to shape [B, num_q_heads, S, K]
         causal_mask = kv_idx_expanded > q_idx
 
         att_scores = att_scores.masked_fill(causal_mask, float('-inf'))
@@ -124,7 +129,6 @@ class SubQAttention(nn.Module):
 
         out = torch.matmul(att_weights, v_sparse)
         
-        # FIX: Removed .detach() so the LM loss can backpropagate through the STE to the router
         out = out * q_ste_weights.unsqueeze(-1)
         
         out = out.transpose(1, 2).contiguous().view(B, S, D)
