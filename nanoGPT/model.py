@@ -26,16 +26,16 @@ class StraightThroughEstimator(torch.autograd.Function):
         return grad_output
 
 class TemperatureScheduler:
-    def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=24000, decay_rate=3.0):
+    def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000, **kwargs):
         self.model = model
         self.t_max = t_max
         self.t_min = t_min
         self.total_steps = total_steps
-        self.decay_rate = decay_rate
 
     def step(self, current_step):
+        # Linear decay across total_steps
         progress = min(1.0, max(0.0, current_step / self.total_steps))
-        temp = self.t_min + (self.t_max - self.t_min) * math.exp(-self.decay_rate * progress)
+        temp = self.t_max - progress * (self.t_max - self.t_min)
         
         target_model = self.model.module if hasattr(self.model, 'module') else self.model
         for block in target_model.layers:
@@ -118,7 +118,7 @@ class SubQAttention(nn.Module):
         att_scores = att_scores.masked_fill(causal_mask, float('-inf'))
         att_weights = F.softmax(att_scores, dim=-1)
         
-        # CRITICAL FIX: Convert NaN rows (where all keys were masked out) to 0.0
+        # Convert NaN rows (where all keys were masked out) to 0.0
         att_weights = torch.nan_to_num(att_weights, nan=0.0)
 
         out = torch.matmul(att_weights, v_sparse)

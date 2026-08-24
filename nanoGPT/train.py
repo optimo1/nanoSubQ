@@ -18,28 +18,21 @@ tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# --- Quick Dry Run Config ---
-# max_iters = 50           
-# eval_interval = 25       
-# log_interval = 5         
-# eval_iters = 5           
-# warmup_iters = 10   
-
-# --- Option 2: Full Training Config (50,000 Steps) ---
+# --- Stable Option 2 Config (50,000 Steps) ---
 max_iters = 50000         
 eval_interval = 2500       
 log_interval = 20         
 eval_iters = 50            
-warmup_iters = 1000     
+warmup_iters = 2000        # Extended warmup for stability
 
-learning_rate = 3e-4  
-min_lr = 3e-5        
+learning_rate = 1.5e-4     # Reduced peak LR to prevent loss divergence
+min_lr = 1.5e-5        
 weight_decay = 0.1
-max_grad_norm = 1.0  
+max_grad_norm = 0.5        # Stricter gradient clipping for router stability
+entropy_coef = 0.01        # Entropy regularization penalty weight
 
 t_max = 2.0
 t_min = 0.1
-t_decay_rate = 3.0
 
 config = nanoSubQConfig(
     vocab_size=50304,
@@ -88,7 +81,7 @@ def configure_optimizer(model, weight_decay, learning_rate):
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
 
 optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
-temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
+temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters)
 
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
@@ -122,11 +115,12 @@ for iter_num in range(1, max_iters + 1):
         x, y = get_batch('train')
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
-            logits, loss, entropy = model(x, targets=y)
-            loss_scaled = loss.mean() / gradient_accumulation_steps  
-            entropy_scaled = entropy.mean() / gradient_accumulation_steps
+            logits, ce_loss, entropy = model(x, targets=y)
+            # Total Loss = CE Loss - Entropy Regularization
+            total_loss = ce_loss.mean() - entropy_coef * entropy.mean()
+            loss_scaled = total_loss / gradient_accumulation_steps  
 
-        accum_loss += loss.mean().item()
+        accum_loss += ce_loss.mean().item()
         accum_entropy += entropy.mean().item()
         
         if ptdtype == torch.float16:
