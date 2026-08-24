@@ -19,11 +19,11 @@ train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mod
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 # --- Quick Dry Run Config ---
-max_iters = 50           # Run for only 50 steps
-eval_interval = 25       # Run validation at step 25 and 50
-log_interval = 5         # Print logs every 5 steps
-eval_iters = 5           # Keep validation fast
-warmup_iters = 10        # Scale down LR warmup
+max_iters = 50           
+eval_interval = 25       
+log_interval = 5         
+eval_iters = 5           
+warmup_iters = 10        
 
 learning_rate = 3e-4  
 min_lr = 3e-5        
@@ -116,16 +116,16 @@ for iter_num in range(1, max_iters + 1):
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
             logits, loss, entropy = model(x, targets=y)
-            loss = loss.mean() / gradient_accumulation_steps  
-            entropy_step = entropy.mean() / gradient_accumulation_steps
+            loss_scaled = loss.mean() / gradient_accumulation_steps  
+            entropy_scaled = entropy.mean() / gradient_accumulation_steps
 
-        accum_loss += loss.item() * gradient_accumulation_steps
-        accum_entropy += entropy_step.item() * gradient_accumulation_steps
+        accum_loss += loss.mean().item()
+        accum_entropy += entropy.mean().item()
         
         if ptdtype == torch.float16:
-            scaler.scale(loss).backward()
+            scaler.scale(loss_scaled).backward()
         else:
-            loss.backward()
+            loss_scaled.backward()
 
     if ptdtype == torch.float16:
         scaler.unscale_(optimizer)
@@ -140,8 +140,8 @@ for iter_num in range(1, max_iters + 1):
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        avg_loss = accum_loss
-        avg_entropy = accum_entropy
+        avg_loss = accum_loss / gradient_accumulation_steps
+        avg_entropy = accum_entropy / gradient_accumulation_steps
         print(f"step {iter_num:5d}/{max_iters} | loss {avg_loss:.4f} | entropy {avg_entropy:.4f} | lr {lr:.6f} | temp {temp:.2f} | time {dt*1000/log_interval:.2f}ms/step")
 
     if iter_num % eval_interval == 0 or iter_num == max_iters:

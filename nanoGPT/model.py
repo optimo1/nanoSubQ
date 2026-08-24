@@ -37,14 +37,12 @@ class TemperatureScheduler:
         progress = min(1.0, max(0.0, current_step / self.total_steps))
         temp = self.t_min + (self.t_max - self.t_min) * math.exp(-self.decay_rate * progress)
         
-        # Handle both raw model and DataParallel wrapper
         target_model = self.model.module if hasattr(self.model, 'module') else self.model
         for block in target_model.layers:
             block.attn.temperature = temp
         return temp
 
 def apply_rotary_emb(x, cos, sin):
-    # x shape: [B, H, S, D]
     d_half = x.shape[-1] // 2
     x1 = x[..., :d_half]
     x2 = x[..., d_half:]
@@ -84,7 +82,7 @@ class SubQAttention(nn.Module):
         router_scores = torch.sigmoid(router_logits).transpose(1, 2)
         ste_weights = StraightThroughEstimator.apply(router_scores)
 
-        # Cast to float32 before clamping to avoid NaN underflow in bfloat16/float16
+        # FP32 computation prevents NaN underflow in reduced precision
         p_fp32 = router_scores.float()
         p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
         entropy = - (p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
@@ -119,6 +117,9 @@ class SubQAttention(nn.Module):
 
         att_scores = att_scores.masked_fill(causal_mask, float('-inf'))
         att_weights = F.softmax(att_scores, dim=-1)
+        
+        # CRITICAL FIX: Convert NaN rows (where all keys were masked out) to 0.0
+        att_weights = torch.nan_to_num(att_weights, nan=0.0)
 
         out = torch.matmul(att_weights, v_sparse)
         out = out * q_ste_weights.unsqueeze(-1)
