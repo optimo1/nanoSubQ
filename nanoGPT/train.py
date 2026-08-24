@@ -13,22 +13,20 @@ out_dir = 'out'
 micro_batch_size = 16   
 gradient_accumulation_steps = 2
 block_size = 512        
-tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# --- Hyperparameters Updated for Absolute Stability ---
 max_iters = 50000         
 eval_interval = 2500       
 log_interval = 20         
 eval_iters = 50            
 warmup_iters = 1000        
 
-learning_rate = 6.0e-5     # Reduced peak learning rate to avoid gradient explosion
-min_lr = 6.0e-6        
+learning_rate = 3.0e-5     # Decreased to 3e-5 for rock-solid stability
+min_lr = 3.0e-6        
 weight_decay = 0.1
-max_grad_norm = 0.25       # Tightened gradient clip norm for router stability
+max_grad_norm = 0.25       
 entropy_coef = 0.01        
 
 t_max = 2.0
@@ -64,27 +62,30 @@ raw_model = nanoSubQ(config)
 def configure_optimizer(model, weight_decay, learning_rate):
     decay_params = []
     no_decay_params = []
+    router_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim < 2 or "router" in name or "temperature" in name or "ln" in name:
+        if "router" in name:
+            router_params.append(param)
+        elif param.ndim < 2 or "temperature" in name or "ln" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
 
     optim_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        {"params": decay_params, "weight_decay": weight_decay, "lr": learning_rate},
+        {"params": no_decay_params, "weight_decay": 0.0, "lr": learning_rate},
+        {"params": router_params, "weight_decay": 0.0, "lr": learning_rate * 0.1}, # 10x smaller LR for router
     ]
 
-    return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
+    return torch.optim.AdamW(optim_groups, betas=(0.9, 0.95))
 
 optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
 temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters)
 
 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-    print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
     model = nn.DataParallel(raw_model).to(device)
 else:
     model = raw_model.to(device)
@@ -103,8 +104,12 @@ t0 = time.time()
 
 for iter_num in range(1, max_iters + 1):
     lr = get_lr(iter_num)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    
+    # Scale main parameters and router parameters proportionately
+    optimizer.param_groups[0]['lr'] = lr
+    optimizer.param_groups[1]['lr'] = lr
+    optimizer.param_groups[2]['lr'] = lr * 0.1
+    
     temp = temp_scheduler.step(iter_num)
 
     optimizer.zero_grad(set_to_none=True)

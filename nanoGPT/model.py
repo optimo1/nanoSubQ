@@ -77,12 +77,10 @@ class SubQAttention(nn.Module):
         q_rot = apply_rotary_emb(q, cos[:, :, :S, :], sin[:, :, :S, :])
         k_rot = apply_rotary_emb(k, cos[:, :, :S, :], sin[:, :, :S, :])
 
-        # Clamp router logits to prevent gradient explosion
         router_logits = torch.clamp(self.router(x), -10.0, 10.0) / self.temperature
         router_scores = torch.sigmoid(router_logits).transpose(1, 2)
         ste_weights = StraightThroughEstimator.apply(router_scores)
 
-        # FP32 computation prevents underflow/overflow in reduced precision
         p_fp32 = router_scores.float()
         p_clamped = torch.clamp(p_fp32, 1e-6, 1.0 - 1e-6)
         entropy = - (p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped)).mean().unsqueeze(0)
@@ -90,7 +88,7 @@ class SubQAttention(nn.Module):
         hist_len = max(0, S - self.window_size)
         
         if hist_len > 0:
-            hist_scores = router_scores[:, :, :hist_len]
+            hist_scores = router_scores.detach()[:, :, :hist_len]
             k_hist = max(1, int(hist_len * self.k_ratio))
             _, topk_indices = torch.topk(hist_scores, k=k_hist, dim=-1)
 
@@ -120,7 +118,10 @@ class SubQAttention(nn.Module):
         att_weights = torch.nan_to_num(att_weights, nan=0.0)
 
         out = torch.matmul(att_weights, v_sparse)
-        out = out * q_ste_weights.unsqueeze(-1)
+        
+        # Detach STE mask during multiplication to prevent router gradient corruption of attention states
+        out = out * q_ste_weights.detach().unsqueeze(-1)
+        
         out = out.transpose(1, 2).contiguous().view(B, S, D)
 
         return self.out_proj(out), entropy
