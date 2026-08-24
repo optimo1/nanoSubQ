@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-
 @dataclass
 class nanoSubQConfig:
     vocab_size: int = 50304
@@ -18,12 +17,11 @@ class nanoSubQConfig:
     dropout: float = 0.0
 
     # --- Router stability controls ---
-    hard_gate: bool = True           # Fixed: Enables hard gating to preserve activation scale
+    hard_gate: bool = True           # Ensure this remains True for STE
     ste_scale: float = 0.5           
     router_lr_mult: float = 0.5      
     usage_target: float = 0.5        
     gate_warmup_steps: int = 2000    
-
 
 class ScaledSTE(torch.autograd.Function):
     @staticmethod
@@ -34,9 +32,7 @@ class ScaledSTE(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output * ScaledSTE.grad_scale
 
-
 ScaledSTE.grad_scale = 0.5  
-
 
 class TemperatureScheduler:
     def __init__(self, model, t_max=2.0, t_min=0.1, total_steps=50000,
@@ -59,14 +55,12 @@ class TemperatureScheduler:
             block.attn.gate_scale = gate_scale
         return temp, gate_scale
 
-
 def apply_rotary_emb(x, cos, sin):
     d_half = x.shape[-1] // 2
     x1 = x[..., :d_half]
     x2 = x[..., d_half:]
     rotated_x = torch.cat((-x2, x1), dim=-1)
     return (x * cos) + (rotated_x * sin)
-
 
 class SubQAttention(nn.Module):
     def __init__(self, config: nanoSubQConfig):
@@ -128,18 +122,24 @@ class SubQAttention(nn.Module):
         k_rot_sparse = torch.gather(k_rot, dim=2, index=gather_idx)
         v_sparse = torch.gather(v, dim=2, index=gather_idx)
 
+        # --- CRITICAL FIX: Gather scores for Keys, apply gate to Values ---
+        kv_scores = torch.gather(router_scores, dim=2, index=kv_indices_sorted)
+
         if self.hard_gate:
-            ste_weights = ScaledSTE.apply(router_scores)
+            ste_weights = ScaledSTE.apply(kv_scores)
             soft_or_hard_gate = ste_weights
         else:
-            soft_or_hard_gate = router_scores
+            soft_or_hard_gate = kv_scores
 
         ones = torch.ones_like(soft_or_hard_gate)
-        blended_gate = self.gate_scale * soft_or_hard_gate + (1.0 - self.gate_scale) * ones
+        blended_kv_gate = self.gate_scale * soft_or_hard_gate + (1.0 - self.gate_scale) * ones
 
-        q_gate = blended_gate.repeat_interleave(self.num_q_per_kv, dim=1)
         k_rot_sparse = k_rot_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
         v_sparse = v_sparse.repeat_interleave(self.num_q_per_kv, dim=1)
+        blended_kv_gate = blended_kv_gate.repeat_interleave(self.num_q_per_kv, dim=1)
+
+        # Gate the Values to pass gradients back to the router without blinding queries
+        v_sparse = v_sparse * blended_kv_gate.unsqueeze(-1)
 
         att_scores = torch.matmul(q_rot, k_rot_sparse.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
@@ -155,8 +155,8 @@ class SubQAttention(nn.Module):
         has_valid_keys = (~causal_mask).any(dim=-1, keepdim=True)
         att_weights = att_weights * has_valid_keys.float()
 
+        # Output is NOT gated here anymore! Queries remain 100% active.
         out = torch.matmul(att_weights, v_sparse)
-        out = out * q_gate.unsqueeze(-1)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
 
         return self.out_proj(out), entropy, usage_penalty
@@ -198,7 +198,6 @@ class nanoSubQ(nn.Module):
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         
-        # Fixed: persistent=True prevents DataParallel replication failure
         self.register_buffer('cos', emb.cos().unsqueeze(0).unsqueeze(0), persistent=True)
         self.register_buffer('sin', emb.sin().unsqueeze(0).unsqueeze(0), persistent=True)
 
