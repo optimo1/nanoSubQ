@@ -14,7 +14,7 @@ data_dir = 'data'
 out_dir = 'out'
 
 micro_batch_size = 16   
-gradient_accumulation_steps = 2 # Effective batch size = 32 (16,384 tokens / iter)
+gradient_accumulation_steps = 2 # Effective batch size = 32 per iteration (16,384 tokens)
 block_size = 512      
 tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 
@@ -22,7 +22,7 @@ tokens_per_iter = micro_batch_size * block_size * gradient_accumulation_steps
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-# Target sprint length: 24,000 steps (~10 hours @ ~1.5s/step)
+# Target length: 24,000 steps (~10 hours on dual GPU)
 max_iters = 24000
 
 print(f"Total tokens available in train.bin: {len(train_data):,}")
@@ -32,11 +32,11 @@ eval_interval = 2000  # Evaluate and save checkpoint every 2,000 steps (~50 mins
 log_interval = 20
 eval_iters = 50
 
-# Learning Rate & Optimizer Config (Scaled for a extended 10-hour run)
-learning_rate = 6e-4  # Slower peak LR to prevent loss plateaus on longer runs
-min_lr = 6e-5        # 10% of peak learning rate
+# Learning Rate & Optimizer Config (Scaled for 10-hour run)
+learning_rate = 6e-4  
+min_lr = 6e-5        
 weight_decay = 0.1
-warmup_iters = 500    # Extended warmup over ~12 minutes for stable initial convergence
+warmup_iters = 500    
 max_grad_norm = 1.0  
 
 # Temperature Schedule Config (Exponential Decay: 2.0 -> 0.1)
@@ -71,9 +71,9 @@ def get_batch(split):
     return x.to(device), y.to(device)
 
 # -----------------------------------------------------------------------------
-# Init Model & Optimizer
+# Init Model, Optimizer, & Multi-GPU Setup
 # -----------------------------------------------------------------------------
-model = nanoSubQ(config).to(device)
+raw_model = nanoSubQ(config)
 
 def configure_optimizer(model, weight_decay, learning_rate):
     decay_params = []
@@ -95,10 +95,17 @@ def configure_optimizer(model, weight_decay, learning_rate):
 
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
 
-optimizer = configure_optimizer(model, weight_decay, learning_rate)
+optimizer = configure_optimizer(raw_model, weight_decay, learning_rate)
 
-# Temperature Scheduler mapped over the full 24,000 steps
-temp_scheduler = TemperatureScheduler(model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
+# Temperature Scheduler targets the underlying model instance
+temp_scheduler = TemperatureScheduler(raw_model, t_max=t_max, t_min=t_min, total_steps=max_iters, decay_rate=t_decay_rate)
+
+# Wrap model with DataParallel if multiple GPUs are available
+if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs!")
+    model = nn.DataParallel(raw_model).to(device)
+else:
+    model = raw_model.to(device)
 
 def get_lr(it):
     if it < warmup_iters:
@@ -130,7 +137,9 @@ for iter_num in range(1, max_iters + 1):
         
         with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
             logits, loss, entropy = model(x, targets=y)
-            loss = loss / gradient_accumulation_steps  
+            # Reduce multi-GPU vectors down to scalar means
+            loss = loss.mean() / gradient_accumulation_steps  
+            entropy = entropy.mean()
 
         accum_loss += loss.item() * gradient_accumulation_steps
         
@@ -141,11 +150,11 @@ for iter_num in range(1, max_iters + 1):
 
     if ptdtype == torch.float16:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
     else:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
     
     if iter_num % log_interval == 0:
@@ -162,12 +171,13 @@ for iter_num in range(1, max_iters + 1):
                 x_v, y_v = get_batch('val')
                 with torch.amp.autocast(device_type='cuda', dtype=ptdtype):
                     _, v_loss, _ = model(x_v, targets=y_v)
-                val_losses.append(v_loss.item())
+                val_losses.append(v_loss.mean().item())
             mean_val_loss = sum(val_losses) / len(val_losses)
             print(f"\n--- EVAL @ Step {iter_num}/{max_iters} | Validation Loss: {mean_val_loss:.4f} ---\n")
             
             ckpt_path = os.path.join(out_dir, f'ckpt_step_{iter_num}.pt')
-            torch.save(model.state_dict(), ckpt_path)
+            # Save raw model weights without the 'module.' DataParallel prefix
+            torch.save(raw_model.state_dict(), ckpt_path)
             
         torch.cuda.empty_cache()
         gc.collect()
