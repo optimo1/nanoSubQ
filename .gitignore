@@ -12,3 +12,10 @@ kaggle_sync/
 
 # Benchmark output
 bench_scaling.csv
+
+# Claude
+.claude/
+
+# Zed
+.zed/
+.envrc
