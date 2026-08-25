@@ -1,8 +1,8 @@
 """Talk to a trained nanoSubQ checkpoint. CPU-friendly (no GPU needed).
 
 Usage:
-    python sample.py out/ckpt_step_16000.pt --prompt "What is the capital of France?"
-    python sample.py out/ckpt_step_16000.pt --interactive     # chat loop
+    python sample.py ckpt_step_16000.pt --prompt "What is the capital of France?"
+    python sample.py ckpt_step_16000.pt --interactive     # chat loop
 """
 import os, sys, argparse
 import torch
@@ -58,7 +58,7 @@ def reply(model, enc, ctx, args):
 
 def main():
     ap = argparse.ArgumentParser(description="Talk to a trained nanoSubQ.")
-    ap.add_argument("ckpt", help="path to the .pt checkpoint (e.g. out/ckpt_step_16000.pt)")
+    ap.add_argument("ckpt", help="path to the .pt checkpoint (e.g. ckpt_step_16000.pt)")
     ap.add_argument("--prompt", default="What is the capital of France?")
     ap.add_argument("--max-new-tokens", type=int, default=200)
     ap.add_argument("--temperature", type=float, default=0.8)

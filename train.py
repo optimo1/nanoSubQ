@@ -29,7 +29,7 @@ ap.add_argument('--kaggle-dataset', type=str, default=None,
                      "then: python train.py --resume restore/latest.pt")
 ap.add_argument('--push', type=str, default=None,
                 help="just push this one checkpoint (.pt) to the kaggle dataset and exit "
-                     "(e.g. --push out/ckpt_step_16000.pt; for verifying the backup works)")
+                     "(e.g. --push ckpt_step_16000.pt; for verifying the backup works)")
 args = ap.parse_args()
 
 

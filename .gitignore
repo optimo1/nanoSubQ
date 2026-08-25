@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data (train.bin is 3.7 GB; never commit the raw corpora)
+data/*.bin
+
+# Checkpoints / backups (large binaries)
+ckpt_step_*
+out/
+kaggle_sync/
+
+# Benchmark output
+bench_scaling.csv
