@@ -1,4 +1,6 @@
 import os
+import re
+import sys
 import time
 import math
 import gc
@@ -25,6 +27,9 @@ ap.add_argument('--kaggle-dataset', type=str, default=None,
                      "or the older KAGGLE_USERNAME/KAGGLE_KEY pair). Resume later with: "
                      "kaggle datasets download <owner>/<dataset> -p restore && unzip -o restore/*.zip -d restore "
                      "then: python train.py --resume restore/latest.pt")
+ap.add_argument('--push', type=str, default=None,
+                help="just push this one checkpoint (.pt) to the kaggle dataset and exit "
+                     "(e.g. --push out/ckpt_step_16000.pt; for verifying the backup works)")
 args = ap.parse_args()
 
 
@@ -47,15 +52,22 @@ def push_to_kaggle(ckpt_path, iter_num):
         shutil.copyfile(ckpt_path, latest)
     meta = os.path.join(kaggle_sync_dir, 'dataset-metadata.json')
     if not os.path.exists(meta):
+        slug = args.kaggle_dataset.split('/')[-1]
         with open(meta, 'w') as f:
-            json.dump({'id': None, 'title': args.kaggle_dataset.split('/')[-1], 'isPrivate': True}, f)
-    with open(meta) as f:
-        is_new = json.load(f).get('id') is None
-    cmd = ['kaggle', 'datasets', 'create' if is_new else 'version',
-           '-p', kaggle_sync_dir, '-m', f'step {iter_num}']
+            # `datasets create` requires a full id, a 6-50 char title, and exactly one license
+            json.dump({'id': args.kaggle_dataset, 'title': slug, 'isPrivate': True,
+                       'licenses': [{'name': 'other'}]}, f, indent=2)
+    # `datasets create` takes NO -m flag; `datasets version` REQUIRES -m. Try version first
+    # (right when the dataset already exists), fall back to create when it doesn't exist yet.
+    cmds = [
+        ['kaggle', 'datasets', 'version', '-p', kaggle_sync_dir, '-m', f'step {iter_num}'],
+        ['kaggle', 'datasets', 'create', '-p', kaggle_sync_dir],
+    ]
     print(f"  backing up latest checkpoint to Kaggle dataset {args.kaggle_dataset} ...", flush=True)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        r = subprocess.run(cmds[0], capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            r = subprocess.run(cmds[1], capture_output=True, text=True, timeout=900)
         tail = (r.stdout or r.stderr or '').strip()[-400:]
         if r.returncode == 0:
             print(f"  kaggle backup OK: {tail}", flush=True)
@@ -63,6 +75,15 @@ def push_to_kaggle(ckpt_path, iter_num):
             print(f"  !! kaggle push reported failure (non-fatal, continuing): {tail}", flush=True)
     except Exception as e:
         print(f"  !! kaggle push failed (non-fatal, continuing): {e}", flush=True)
+
+# --push mode: back up one existing checkpoint and exit (no training). Lets you verify the
+# kaggle backup works and durably store a finished model without re-running training.
+if args.push is not None:
+    assert args.kaggle_dataset is not None, "--push requires --kaggle-dataset owner/slug"
+    m = re.search(r'(\d+)', os.path.basename(args.push))
+    step = int(m.group(1)) if m else 0
+    push_to_kaggle(args.push, step)
+    sys.exit(0)
 
 micro_batch_size = 16
 gradient_accumulation_steps = 2
