@@ -113,6 +113,6 @@
 ---
 
 ## 4. Verification, Benchmarking & Performance
-- [ ] **Overfitting Sanity Check:** Train on a single small batch (64 tokens) for 100 steps to confirm loss drops near $0.0$ and STE gradients update router weights properly.
-- [ ] **Verify Linear Complexity $O(N \cdot K)$:** Measure memory footprint (VRAM usage) and execution time across growing context lengths ($N = 512 \to 2048$), confirming scale advantages over standard $O(N^2)$ attention.
-- [ ] **Chatbot Inference Test:** Run `model.generate()` using temperature (`0.7`) and top-$p$ (`0.9`) sampling with a system prompt to verify coherent, fast multi-turn responses.
+- [done] **Overfitting Sanity Check:** Train on a single small batch (64 tokens) for 100 steps to confirm loss drops near $0.0$ and STE gradients update router weights properly.
+- [done] **Verify Linear Complexity $O(N \cdot K)$:** Measure memory footprint (VRAM usage) and execution time across growing context lengths ($N = 512 \to 2048$), confirming scale advantages over standard $O(N^2)$ attention.
+- [done] **Chatbot Inference Test:** Run `model.generate()` using temperature (`0.7`) and top-$p$ (`0.9`) sampling with a system prompt to verify coherent, fast multi-turn responses.
