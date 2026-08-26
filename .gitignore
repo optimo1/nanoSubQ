@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 
 # Data (train.bin is 3.7 GB; never commit the raw corpora)
-data/*.bin
+nanoGPT/data/*.bin
 
 # Checkpoints / backups (large binaries)
 ckpt_step_*
